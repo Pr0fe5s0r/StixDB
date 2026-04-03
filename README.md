@@ -1,4 +1,8 @@
 <p align="center">
+  <img src="assets/stix_logo.png" alt="StixDB Logo" width="200" />
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square" />
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" />
   <a href="https://pypi.org/project/stixdb-engine/"><img src="https://img.shields.io/pypi/v/stixdb-engine?style=flat-square&label=stixdb-engine" /></a>
