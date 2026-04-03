@@ -47,7 +47,7 @@ def serve(
         border_style="cyan",
     ))
     uvicorn.run(
-        "stix.api.server:app",
+        "stixdb.api.server:app",
         host=host,
         port=port,
         reload=reload,

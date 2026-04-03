@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "stixdb-engine"
-version = "0.1.0"
+version = "0.1.1"
 description = "StixDB — Reasoning Agentic Context Database. An autonomous AI agent lives inside the DB itself, managing a self-organizing graph memory layer for other agents."
 authors = [{ name = "StixDB" }]
 readme = "README.md"

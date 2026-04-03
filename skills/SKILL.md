@@ -64,6 +64,38 @@ async with StixDBEngine() as engine:
 
 ---
 
+## Server Setup
+
+Start the StixDB API server to expose your memory engine over HTTP.
+
+### 1. Launch via CLI (Recommended)
+Use the built-in CLI to quickly start the server:
+
+```bash
+stixdb serve --port 4020 --reload
+```
+- `--port`: Set a custom port (default: 4020)
+- `--host`: Bind to a specific host (default: 0.0.0.0)
+- `--reload`: Enable hot-reload for dev mode
+
+### 2. Launch via Scripts (Local Persistence)
+The repository includes dedicated scripts that pre-configure the environment with **KuzuDB** for persistent graph storage. This is ideal for local development as it doesn't require Docker.
+
+- **Windows:** `.\start-local.ps1`
+- **Linux/macOS:** `./start-local.sh`
+
+### 3. Launch via Environment Variables
+If starting manually, the server reads configuration from the `.env` file or environment variables:
+
+```bash
+export OPENAI_API_KEY=sk-...
+export STIX_STORAGE_MODE=kuzu
+export STIX_KUZU_PATH=./my_storage
+uvicorn stixdb.api.server:app --port 4020
+```
+
+---
+
 ## Lifecycle Management
 
 ### Start Engine
@@ -253,55 +285,49 @@ result = await engine.bulk_store(
 
 ## Ingesting Files and Folders
 
+Automatically parse, chunk, and index documents into your memory graph.
+
 ### Ingest Single File
-Automatically parse and chunk documents:
+The engine supports a wide range of text-based and document formats:
 
 ```python
 result = await engine.ingest_file(
     collection="agent_name",
-    file_path="/path/to/document.pdf",
+    filepath="/path/to/document.pdf",
     
-    # Optional
-    tags=["source_doc"],
-    chunk_size=1000,       # Characters per chunk
-    chunk_overlap=200,     # Overlap for context
-    parser="auto",         # or specific: "pdf", "markdown", etc.
-    preserve_structure=True,  # Maintain formatting when possible
+    # Optional parameters
+    tags=["source_doc", "q1_report"],
+    chunk_size=1000,          # Base chunk size (characters)
+    chunk_overlap=200,        # Context overlap between chunks
+    parser="auto",            # or specific: "pdf", "text", "langchain"
 )
 ```
 
-**Returns:**
-```python
-{
-    "collection": "agent_name",
-    "file": "document.pdf",
-    "chunks_created": 42,
-    "bytes_processed": 123456,
-    "time_seconds": 2.3,
-    "tags_applied": ["source_doc"]
-}
-```
+**Key Features:**
+- **Automatic PDF Parsing:** Uses `pypdf` to extract text from each page, preserving page numbers in metadata.
+- **Deduplication:** Internal hashing (`document_hash` and `content_hash`) prevents the same chunk from being stored multiple times across repeated ingestions.
+- **Metadata Enrichment:** Automatically attaches `filepath`, `filename`, `filetype`, `parser_used`, and `ingested_at` to each chunk's metadata.
+- **Source Attribution:** Each chunk is tagged with its source name for easy retrieval and tracing during agentic reasoning.
 
-**Supported file types:**
-- Documents: `.pdf`, `.md`, `.txt`, `.rst`, `.html`
-- Data: `.csv`, `.tsv`, `.json`, `.jsonl`, `.yaml`
-- Code: `.py`, `.js`, `.ts`, `.java`, `.go`, `.rs`, `.sql`, etc.
-- Config: `.toml`, `.ini`, `.cfg`, `.conf`
+**Supported File Types:**
+- **Documents:** `.pdf`, `.md`, `.markdown`, `.rst`, `.html`, `.htm`
+- **Data/Config:** `.csv`, `.tsv`, `.json`, `.jsonl`, `.yaml`, `.yml`, `.toml`, `.ini`, `.xml`
+- **Code:** `.py`, `.js`, `.ts`, `.tsx`, `.jsx`, `.java`, `.c`, `.cpp`, `.cs`, `.go`, `.rs`, `.sh`, `.sql`, etc.
+- **Logs:** `.log`, `.txt`
 
 ### Ingest Entire Folder
-Recursively process all files in a directory:
+Recursively process all supported files in a directory hierarchy:
 
 ```python
 result = await engine.ingest_folder(
     collection="agent_name",
-    folder_path="/path/to/docs",
+    folderpath="/path/to/docs",
     
     # Optional
     tags=["documentation"],
-    chunk_size=1000,
-    chunk_overlap=200,
-    parser="auto",
-    recursive=True,  # Include subdirectories
+    chunk_size=800,
+    chunk_overlap=150,
+    recursive=True,  # Search subdirectories recursively
 )
 ```
 
@@ -310,20 +336,25 @@ result = await engine.ingest_folder(
 {
     "collection": "agent_name",
     "folder": "/path/to/docs",
-    "files_processed": 45,
-    "files_skipped": 3,
-    "total_chunks": 312,
-    "time_seconds": 8.5,
+    "files_processed": 142,
+    "files_skipped": 5,
     "ingested": [
         {
             "filepath": "...",
-            "relative_path": "...",
-            "chunks": 12
+            "source_name": "docs/sub/file.pdf",
+            "node_ids": ["uuid1", "uuid2"],
+            "ingested_chunks": 12
         }
     ],
-    "skipped": ["file1.exe", "file2.bin"]
+    "skipped": ["temp.bin", "logo.png"]
 }
 ```
+
+### Best Practices for Ingestion
+- **Chunk Size Tuning:** Use smaller chunks (500-800) for technical documents or code to maintain precision; use larger chunks (1000-1500) for narrative or prose.
+- **Overlap:** Always keep some overlap (15-20% of `chunk_size`) to ensure the agent doesn't lose context at chunk boundaries.
+- **Tagging:** Use hierarchical tags like `["ingestion", "manuals", "v1.2"]` to simplify later filtering.
+- **Source Filtering:** When using `engine.ask()`, you can filter by source tags to focus the agent's attention on specific documents.
 
 **Best Practices:**
 - Use `chunk_size=1000` as baseline; adjust for document density
