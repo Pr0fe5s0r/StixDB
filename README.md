@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/LLM-OpenAI%20%7C%20Anthropic%20%7C%20Ollama-purple?style=flat-square" />
 </p>
 
-<h1 align="center">StixDB — Living Memory for AI Agents</h1>
+<h1 align="center">StixDB - Living Memory for AI Agents</h1>
 
 <p align="center"><b>A self-organizing memory database for AI agents. Stores facts, cleans up stale data automatically, and answers questions with citations.</b></p>
 
