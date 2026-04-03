@@ -3,474 +3,205 @@
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" />
   <a href="https://pypi.org/project/stixdb-engine/"><img src="https://img.shields.io/pypi/v/stixdb-engine?style=flat-square&label=stixdb-engine" /></a>
   <a href="https://pypi.org/project/stixdb-sdk/"><img src="https://img.shields.io/pypi/v/stixdb-sdk?style=flat-square&label=stixdb-sdk" /></a>
-  <img src="https://img.shields.io/github/actions/workflow/status/your-org/stixdb/ci.yml?style=flat-square&label=CI" />
   <img src="https://img.shields.io/badge/LLM-OpenAI%20%7C%20Anthropic%20%7C%20Ollama-purple?style=flat-square" />
-  <img src="https://img.shields.io/badge/API-Search%20%7C%20Ask%20%7C%20OpenAI--compat-orange?style=flat-square" />
 </p>
 
 <h1 align="center">StixDB — Living Memory for AI Agents</h1>
 
-<p align="center"><b>Stop shoving documents into filing cabinets. Give your agent an Autonomous Librarian.</b></p>
-
-<p align="center">
-  StixDB exposes a <b>Search API</b> and an <b>Ask API</b> over your private knowledge —<br/>
-  documents, agent memories, ingested data — with the same interface shape as Perplexity:<br/>
-  ranked results from Search, grounded cited answers from Ask.<br/><br/>
-  Under the hood every collection runs an autonomous agent that continuously<br/>
-  reorganises memory, merges duplicates, decays stale facts, and reasons over a live graph.
-</p>
+<p align="center"><b>A self-organizing memory database for AI agents. Stores facts, cleans up stale data automatically, and answers questions with citations.</b></p>
 
 ---
 
-## StixDB = Private Perplexity for Your Data
+## What is StixDB?
 
-Perplexity's Sonar API searches the live web and returns cited answers.
-**StixDB does the same for your private knowledge base.**
+When you build an AI agent, it needs somewhere to remember things. You could use a simple vector database — but that's like a filing cabinet that **never gets tidied**. Stale facts pile up, duplicates accumulate, and the agent has no way to know what's fresh vs. what's a month old.
 
-| | Perplexity Sonar | StixDB |
-|---|---|---|
-| **Data source** | Live web | Your documents, memories, agent data |
-| **Search API** | Web search → ranked results | `/search` → ranked nodes across collections |
-| **Ask API** | Web context → cited LLM answer | `/ask` → graph-grounded cited LLM answer |
-| **Citations** | Source URLs | Source nodes with content, tier, score |
-| **Memory** | Stateless | Self-organising graph — decays, merges, promotes |
-| **Streaming** | ✅ | ✅ `/chat/completions` with `"stream": true` |
-| **OpenAI-compat** | ❌ | ✅ Drop-in at `POST /chat/completions` |
-| **Private / on-prem** | ❌ | ✅ Fully self-hosted |
-| **Requires API key** | Yes (`pplx-…`) | **Search API: No — Ask API: Yes (any LLM provider)** |
-| **Requires Docker** | N/A | **No — `pip install stixdb-engine` is enough to start** |
-
-### The two APIs
-
-**Search API** — fast ranked retrieval, no LLM:
-
-```bash
-# Perplexity style: search your private data
-POST /search
-{
-  "query": "What are the upcoming project deadlines?",
-  "collections": ["project", "team"],
-  "max_results": 5
-}
-
-# Response: ranked nodes with scores, tiers, and source lineage
-```
-
-**Ask API** — grounded, cited answers:
-
-```bash
-# Ask your private knowledge base
-POST /collections/project/ask
-{
-  "question": "Who is responsible for the payments deadline?",
-  "top_k": 10
-}
-
-# Response: synthesised answer + citations + confidence + reasoning trace
-{
-  "answer": "Alice (lead engineer, payments team) owns the June 1st deadline.",
-  "confidence": 0.93,
-  "sources": [
-    { "content": "Alice is the lead engineer on the payments team", "score": 0.96 },
-    { "content": "Project deadline is June 1st, 2026", "score": 0.91 }
-  ]
-}
-```
-
-**OpenAI-compatible endpoint** — drop in anywhere:
-
-```bash
-POST /chat/completions
-{
-  "model": "project",        # collection name becomes the model
-  "messages": [{ "role": "user", "content": "What are the upcoming milestones?" }],
-  "stream": true
-}
-```
-
-Works out of the box with the OpenAI Python SDK, LangChain `ChatOpenAI`, or any tool that speaks the OpenAI spec — just point `base_url` at your StixDB instance.
+StixDB is different. Every collection of memories has a built-in **background agent** that continuously organizes data: merging near-duplicate facts, decaying things you haven't looked at in days, and promoting frequently-accessed knowledge to the front of the queue.
 
 ---
 
-## Stop Shoving Documents into Filing Cabinets
+## Quick Start (No API Keys Needed!)
 
-Standard RAG is a mess of duplicates and stale facts. You shove documents in, retrieve the nearest neighbors, and hope the LLM stitches them into something useful.
-
-```
-Traditional RAG:
-
-  User Question
-       │
-       ▼
-  [Vector Search]  ──→  top-k chunks (static, never changes)
-       │
-       ▼
-  [LLM Prompt]     ──→  answer (no memory of what was useful)
-```
-
-The filing cabinet never organises itself. Stale facts stay forever. Duplicates pile up. Hot information gets no priority over cold. Nothing learns from access patterns.
-
-**StixDB is an Autonomous Librarian.**
-
-```
-StixDB:
-
-  User Question
-       │
-       ▼
-  [7-Phase Retrieval]  ──→  contextual answer + reasoning trace + cited sources
-       │
-       ▲
-  [Living Memory Graph]
-       │
-  ┌────┴──────────────────────────────────────────────┐
-  │  MemoryAgent (runs every 30 seconds)               │
-  │                                                    │
-  │  PERCEIVE  ──  track which nodes are accessed      │
-  │  PLAN      ──  score heat: 0.6×frequency +         │
-  │                            0.4×recency             │
-  │  ACT       ──  promote hot nodes → working memory  │
-  │                merge semantically similar nodes    │
-  │                decay importance by half every 48h  │
-  │                prune nodes below 0.05 importance   │
-  └────────────────────────────────────────────────────┘
-```
-
----
-
-## What Makes StixDB Different
-
-| Capability | Traditional RAG | StixDB |
-|---|---|---|
-| Retrieval | Vector similarity | 7-phase: vector → graph BFS → tier-aware re-rank → LLM reason |
-| Memory structure | Flat chunks | Typed graph nodes with edges and clusters |
-| Stale data | Stays forever | Exponential decay (`importance × 2^(-t/48h)`) |
-| Duplicates | Pile up | Auto-merged when cosine similarity > 0.88 |
-| Hot vs cold | No concept | 5 tiers: `working → episodic → semantic → procedural → archived` |
-| Access patterns | Ignored | LRU+LFU hybrid heat scoring drives tier promotion |
-| Answers | Raw chunks | LLM synthesis with citations and reasoning trace |
-| Background work | None | Autonomous `perceive → plan → act` loop per collection |
-| Source lineage | Lost on re-chunk | Preserved across merges (`parent_node_ids`, char offsets) |
-| LLM dependency | Required | Optional — heuristic mode works with no API key |
-
----
-
-## Getting Started
-
-**Local development (no Docker):**
+Install:
 ```bash
 pip install "stixdb-engine[local-dev]"
 ```
 
-See [QUICKSTART.md](QUICKSTART.md) for a complete guide to building agent memory on your laptop.
+Run (completely local — no API key, no cloud, no Docker):
+```python
+import asyncio
+from stixdb import StixDBEngine, StixDBConfig
+from stixdb.config import StorageConfig, StorageMode, ReasonerConfig, LLMProvider
 
-**Production (Docker):**
-```bash
-docker compose up -d
+async def main():
+    config = StixDBConfig(
+        storage=StorageConfig(mode=StorageMode.KUZU, kuzu_path="./my_db"),
+        reasoner=ReasonerConfig(provider=LLMProvider.NONE),  # No API key needed
+    )
+    async with StixDBEngine(config=config) as engine:
+        await engine.store("my_agent", "Alice is the lead engineer on payments.")
+        await engine.store("my_agent", "Project deadline is June 1st, 2026.")
+
+        results = await engine.retrieve("my_agent", "Who leads the payments team?")
+        for r in results:
+            print(r['content'])
+
+asyncio.run(main())
 ```
-
-See [PRODUCTION.md](PRODUCTION.md) for scaling, multi-agent deployments, and operations.
 
 ---
 
-## How It Works
+## How the Three Modes Work
 
-### Memory Node Types
+### Mode 1 — No API Key (Heuristic Search)
+`LLMProvider.NONE` activates **heuristic mode**. You can still store and search memories — you just don't get AI-synthesized answers.
 
-```
-fact        →  "Project deadline is June 1st, 2026"
-entity      →  "Alice — lead engineer, payments team"
-event       →  "Sprint review on April 10th"
-concept     →  "Payments module uses event-sourcing pattern"
-procedure   →  "How to deploy to production"
-summary     →  [auto-generated merge of related facts]
-question    →  "What are the upcoming deadlines?"  (cached answers)
-```
-
-### Memory Tiers
-
-```
-working     ─── hot, frequently accessed  ← +0.15 retrieval boost
-episodic    ─── recent, not yet generalised
-semantic    ─── generalised knowledge (often from consolidation)
-procedural  ─── skills and how-to sequences
-archived    ─── cold, eligible for pruning
-```
-
-The agent automatically promotes and demotes nodes based on access heat.
-
-### The 7-Phase Retrieval Pipeline
-
-```
-1. Embed Query       →  384-dim vector for the question
-2. Vector Search     →  top-15 semantic candidates (threshold: 0.25)
-3. Graph BFS         →  expand to neighbours (depth 2)
-4. Tier Re-rank      →  working memory nodes get +0.15 score boost
-5. Truncate          →  keep top 20 nodes by combined score
-6. LLM Reason        →  synthesise answer with citations
-7. Record & Trace    →  update access counts, emit telemetry
-```
-
-### The Background Agent Cycle (every 30 seconds)
+**Exactly what it does:** The engine retrieves the top-K semantically similar nodes using **cosine similarity** on 384-dim sentence embeddings, then re-ranks them by their `importance` score. The result is an ordered list of matching facts — fast, accurate, and completely free.
 
 ```python
-# PERCEIVE
-access_data = planner.collect_access_patterns()
-
-# PLAN — hybrid heat score
-heat = 0.6 * frequency_score   # saturates at 10 accesses/24h
-     + 0.4 * recency_score     # half-life: 12 hours
-
-# ACT
-if heat > 0.65:  promote → working memory
-if decay < 0.08: demote  → archived
-if similarity(node_a, node_b) > 0.88:  merge → summary node
-if importance < 0.05 and tier == archived:  prune permanently
+# Returned results (no LLM synthesis, just ranked matches):
+results = await engine.retrieve("my_agent", "payment deadline")
+# [{"content": "Project deadline is June 1st", "score": 0.91, ...}, ...]
 ```
 
----
-
-## RAG vs StixDB — Side by Side
-
-### Scenario: A month of project updates ingested
-
-**RAG after 30 days**
+### Mode 2 — With an LLM API Key (Full Reasoning)
+Add `OPENAI_API_KEY` (or Anthropic/Ollama) and unlock `ask()` and `chat()`. The engine now synthesizes a natural-language answer **with cited sources** using the 7-phase retrieval pipeline.
 
 ```python
-results = vector_db.search("project status", top_k=5)
-# Returns 5 chunks, including:
-# - "Sprint 1 complete" (from day 1 — stale, never removed)
-# - "Sprint 1 complete" (duplicate, from a different doc format)
-# - "Sprint 2 in progress" (from week 2 — outdated)
-# - "Sprint 4 kicked off" (current)
-# - "Alice joined the team" (relevant)
-#
-# No synthesis. No ranking by freshness. No deduplication.
-# The LLM now has contradictory context and must figure it out.
+# Set key once in your terminal: export OPENAI_API_KEY=sk-...
+config = StixDBConfig(
+    reasoner=ReasonerConfig(provider=LLMProvider.OPENAI, model="gpt-4o"),
+)
+async with StixDBEngine(config=config) as engine:
+    response = await engine.ask("my_agent", "Who owns the June deadline?")
+    print(response.answer)          # "Alice, lead engineer on payments."
+    print(response.reasoning_trace) # Step-by-step: why it chose those facts
+    print(response.confidence)      # 0.93
 ```
 
-**StixDB after 30 days**
+### Mode 3 — Standalone Server + SDK
+Start a server and connect via the Python SDK (good for microservices or multiple processes):
+
+```bash
+stixdb serve --port 4020
+```
+```python
+from stixdb_sdk import StixDBClient
+with StixDBClient("http://localhost:4020") as client:
+    client.memory.store("my_agent", content="Alice leads payments.")
+    client.memory.ingest_folder("my_agent", folder_path="./docs")
+    answer = client.query.ask("my_agent", question="Who leads payments?")
+```
+
+---
+
+## The Background Agent — What It Actually Does
+
+Every 30 seconds (configurable), a background cycle runs per collection. Here's **exactly** what happens:
+
+### Step 1: Merge near-duplicate facts (Pairwise cosine similarity)
+It loads a batch of up to 64 episodic + semantic nodes (`max_consolidation_batch`), computes pairwise cosine similarity between their embeddings, and merges any pair that exceeds **0.88 similarity** (configurable, default `consolidation_similarity_threshold=0.88`).
+
+A merged pair becomes a new `[SUMMARY]` node whose embedding is the normalized average of the two originals. **The originals are archived (not deleted)** and flagged with `lineage_preserved=True` so you can always trace where a summary came from.
+
+### Step 2: Remove exact duplicates (Hash-based deduplication)
+Nodes with identical content hashes (`content_hash`) or identical document chunk hashes (`document_hash:chunk_index`) are deduplicated — only the highest-tier, highest-importance copy is kept.
+
+### Step 3: Decay and prune cold nodes (Exponential decay)
+Each archived node's importance score decays with a half-life of **48 hours** (configurable, `decay_half_life_hours=48`):
+
+```
+decay_score = importance × 2^(-(hours_since_access / 48))
+```
+
+Nodes with `decay_score < 0.05` (configurable, `prune_importance_threshold=0.05`) that are **not pinned** are permanently deleted.
+
+### What's the CPU cost?
+The cycle processes a maximum of 64 nodes (`max_consolidation_batch=64`) per run. All comparisons are in-process NumPy operations. On a typical laptop:
+- **10–100 nodes**: cycle takes ~5–20ms
+- **1,000 nodes**: cycle takes ~100–300ms (pairwise on the 64-node batch, not all 1,000)
+- **100,000 nodes**: cycle still processes the same 64-node batch — **the batch size caps CPU cost**
+
+The cycle runs in the background on an async loop and **does not block your queries**.
+
+---
+
+## Scale Expectations (Honest Numbers)
+
+StixDB uses an in-process NumPy cosine search by default. Here's what to expect:
+
+| Node Count | Vector Search Latency | Background Cycle | Storage Backend |
+|---|---|---|---|
+| ~100 | < 1ms | ~5ms | In-memory (default) |
+| ~10,000 | ~5–15ms | ~50–100ms | KuzuDB recommended |
+| ~100,000 | ~50–150ms | ~150ms (capped batch) | KuzuDB or Neo4j |
+| > 500,000 | Switch to Qdrant | ~150ms (capped) | Neo4j + Qdrant |
+
+The background agent's **batch cap** (`max_consolidation_batch=64`) means it never processes your entire graph at once — it samples a representative slice. This keeps cycle time predictable regardless of total node count.
+
+---
+
+## Configuration Quick Reference
+
+All settings read from environment variables or a `.env` file:
+
+```bash
+# LLM (optional — for ask() and chat())
+STIXDB_LLM_PROVIDER=openai         # openai | anthropic | ollama | none
+OPENAI_API_KEY=sk-...
+
+# Storage (default: in-memory, lost on restart)
+STIXDB_STORAGE_MODE=kuzu           # memory | kuzu (persistent) | neo4j
+STIXDB_KUZU_PATH=./my_db
+
+# Background agent tuning
+STIXDB_AGENT_CYCLE_INTERVAL=30.0           # How often the cycle runs (seconds)
+STIXDB_AGENT_CONSOLIDATION_THRESHOLD=0.88  # Merge similar nodes above this cosine score
+STIXDB_AGENT_DECAY_HALF_LIFE=48.0          # Hours before an unused node halves in importance
+STIXDB_AGENT_PRUNE_THRESHOLD=0.05          # Delete node if importance falls below this
+
+# Server
+STIXDB_API_PORT=4020
+STIXDB_API_KEY=your-secret-key             # Optional — auth for the REST API
+```
+
+Load in code with one line:
+```python
+config = StixDBConfig.from_env()
+```
+
+---
+
+## Ingesting Documents
 
 ```python
-response = await engine.ask("my_agent", "What is the project status?")
-# Working memory (tier=working, heat=0.91):
-#   → "Sprint 4 kicked off — focus is payments integration"
-#   → "Alice is leading sprint 4 delivery"
-#
-# Auto-merged:
-#   → "Sprint 1 complete" + "Sprint 1 done" → single summary node (archived)
-#
-# Decayed and pruned:
-#   → "Sprint 2 in progress" — importance=0.03, pruned at day 22
-#
-# Response:
-#   answer: "Sprint 4 is currently active, focused on payments integration.
-#            Alice is leading delivery."
-#   sources: [cited working-memory nodes]
-#   reasoning_trace: [step-by-step]
+# Single PDF (uses pypdf, preserves page numbers in metadata)
+await engine.ingest_file("my_agent", filepath="./manual.pdf", tags=["docs"])
+
+# Entire folder (recursive, auto-detects .pdf, .md, .txt, .json, .py, etc.)
+await engine.ingest_folder("my_agent", folderpath="./docs", recursive=True)
 ```
+
+Deduplication is built-in: ingesting the same file twice will not create duplicate chunks (hashed at the chunk level).
 
 ---
 
-## Architecture
+## Storage Backends
 
-```
-StixDBEngine
-├── MemoryGraph          — unified graph + vector interface
-│   ├── StorageBackend   — graph topology (NetworkX / KuzuDB / Neo4j)
-│   └── VectorStore      — semantic search (NumPy / ChromaDB / Qdrant)
-│
-├── MemoryAgent          — per-collection autonomous agent
-│   ├── AccessPlanner    — LRU+LFU heat scoring → tier promotion
-│   ├── Consolidator     — cosine merge (0.88) + decay + prune (0.05)
-│   └── MemoryAgentWorker— async background loop (APScheduler)
-│
-├── ContextBroker        — 7-phase retrieval + LLM reasoning
-│   └── Reasoner         — OpenAI / Anthropic / Ollama / Custom / None
-│
-└── FastAPI Server       — REST API + OpenAI-compatible endpoint
-```
+| Backend | Install | Persistence | Best For |
+|---|---|---|---|
+| **In-Memory (NumPy)** | Included | ❌ Lost on restart | Testing, prototypes |
+| **KuzuDB** | `pip install "stixdb-engine[local-dev]"` | ✅ On-disk | Local dev, laptops |
+| **Neo4j + Qdrant** | Docker | ✅ Production | High scale, multi-agent |
 
 ---
 
-## Storage & Vector Backends
+## Go Deeper
 
-### Graph Storage
-
-| Backend | Mode | Use Case | Install |
-|---------|------|----------|---------|
-| NetworkX | `memory` | Learning / testing — data lost on exit | Included |
-| KuzuDB | `kuzu` | Local development — persistent on disk | `pip install stixdb-engine[local-dev]` |
-| Neo4j | `neo4j` | Production — scalable with Docker | `pip install stixdb-engine[neo4j]` |
-
-### Vector Search
-
-| Backend | Scale | Install |
-|---------|-------|---------|
-| NumPy | Up to ~500k nodes | Included |
-| ChromaDB | Medium scale | `pip install stixdb-engine` (included) |
-| Qdrant | Billion-scale | `pip install stixdb-engine[qdrant]` |
-
-### LLM Providers
-
-```python
-LLMProvider.OPENAI     # gpt-4o, gpt-4-turbo, ...
-LLMProvider.ANTHROPIC  # claude-3-5-sonnet, claude-3-opus, ...
-LLMProvider.OLLAMA     # llama3, mistral, phi3, ... (local)
-LLMProvider.CUSTOM     # any OpenAI-compatible endpoint
-LLMProvider.NONE       # heuristic mode — no API key needed
-```
-
-### Embedding Providers
-
-```python
-EmbeddingProvider.SENTENCE_TRANSFORMERS  # all-MiniLM-L6-v2, local, free
-EmbeddingProvider.OPENAI                 # text-embedding-3-small/large
-EmbeddingProvider.OLLAMA                 # nomic-embed-text, local
-EmbeddingProvider.CUSTOM                 # any OpenAI-compatible endpoint
-```
-
----
-
-## API & SDK
-
-StixDB exposes:
-
-- **REST API**: HTTP endpoints for store, retrieve, ask, upload, agent inspection
-- **OpenAI-compatible endpoint**: `/v1/chat/completions` for drop-in replacement
-- **Python SDK**: `stixdb-sdk` — sync and async clients
-
-Full API reference and examples:
-- See [QUICKSTART.md](QUICKSTART.md) for local development examples
-- See [PRODUCTION.md](PRODUCTION.md) for deployment, scaling, and monitoring
-
----
-
-## Resources
-
-- **[QUICKSTART.md](QUICKSTART.md)** — Build agent memory on your laptop (local development)
-- **[PRODUCTION.md](PRODUCTION.md)** — Deploy with Docker for scaling and multi-agent
-- **[Cookbooks](cookbooks/)** — Runnable examples for all SDK patterns
-- **[Architecture Docs](doc/)** — Deep dives into design and performance
-- **[Contributing](CONTRIBUTING.md)** — How to contribute to the project
-
----
-
-## Development
-
-### Running tests
-
-```bash
-pip install stixdb-engine[dev]
-pytest tests/ -v
-```
-
-### Building the SDK
-
-```bash
-pip install build twine
-python -m build
-```
-
----
-
-## Project Layout
-
-```
-stixdb/             Core engine (graph, agent, broker, API)
-sdk/                Lightweight Python HTTP client (stixdb-sdk)
-examples/           Runnable examples (core, agents, search, OpenAI-compat)
-demos/              Standalone sandboxes for experimentation
-scripts/            Benchmarks, debug helpers, manual test clients
-doc/                Architecture and performance documentation
-tests/              Automated test suite
-```
-
----
-
-### One-time setup
-
-**1. Create a PyPI account**
-
-Register at [pypi.org](https://pypi.org) and create an API token:
-`Account settings → API tokens → Add API token` (scope: entire account for first upload, then per-project).
-
-**2. Configure trusted publishing (recommended — no stored secrets)**
-
-In your GitHub repo go to `Settings → Environments → New environment` and name it `pypi`.
-
-Then on PyPI go to your project page → `Settings → Publishing` and add a trusted publisher:
-- Owner: `your-org`
-- Repository: `stixdb`
-- Workflow: `publish-sdk.yml`
-- Environment: `pypi`
-
-This lets GitHub Actions publish without storing an API key anywhere.
-
-**3. Install build tools locally**
-
-```bash
-pip install build twine hatch
-```
-
----
-
-### Publishing `stixdb-sdk`
-
-**Manual publish (first time or hotfix)**
-
-```bash
-cd sdk
-
-# Bump the version in sdk/pyproject.toml, then:
-python -m build                  # creates dist/stixdb_sdk-x.y.z.tar.gz and .whl
-twine check dist/*               # verify the package is valid
-twine upload dist/*              # uploads to PyPI — prompts for token
-```
-
-**Automated publish via GitHub Actions**
-
-```bash
-# Bump version in sdk/pyproject.toml, commit, then tag:
-git tag sdk-v0.2.0
-git push origin sdk-v0.2.0
-# The publish-sdk.yml workflow triggers automatically
-```
-
----
-
-### Publishing `stixdb-engine`
-
-```bash
-# From the repo root:
-python -m build                  # creates dist/ from root pyproject.toml
-twine check dist/*
-twine upload dist/*
-```
-
-Add a `publish-engine.yml` workflow following the same pattern as `publish-sdk.yml`
-(trigger on tags matching `engine-v*`).
-
----
-
-### Version bump checklist
-
-- [ ] Update `version` in `sdk/pyproject.toml` (for SDK releases)
-- [ ] Update `version` in `pyproject.toml` (for engine releases)
-- [ ] Update `__version__` in `sdk/src/stixdb_sdk/__init__.py`
-- [ ] Update `__version__` in `stixdb/__init__.py`
-- [ ] Add a `CHANGELOG.md` entry
-- [ ] Tag the commit and push
-
----
-
-## Contributing
-
-We welcome contributions of all kinds — bug reports, features, docs, examples.
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) to get started.
-
-If you find a security issue, see [SECURITY.md](SECURITY.md).
+- **[QUICKSTART.md](QUICKSTART.md)** — Step-by-step guide from zero to a working agent memory.
+- **[cookbooks/](cookbooks/)** — Runnable examples: PDF chat, LangChain RAG, multi-agent, OpenAI-compat.
+- **[PRODUCTION.md](PRODUCTION.md)** — Docker deployment and operations.
+- **[DEVELOPMENT.md](DEVELOPMENT.md)** — Build, test, and publish guide for contributors.
 
 ---
 
@@ -478,8 +209,6 @@ If you find a security issue, see [SECURITY.md](SECURITY.md).
 
 MIT — see [LICENSE](LICENSE).
 
----
-
 <p align="center">
-  <i>Built with the vision of making AI agents smarter through intelligent, autonomous memory.</i>
+  <i>AI agents deserve better than flat files. Give yours a living memory.</i>
 </p>
