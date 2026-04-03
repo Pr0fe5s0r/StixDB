@@ -1,0 +1,35 @@
+{
+  "skill_name": "engine-memory-layer",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I'm setting up StixDBEngine for my agent. Walk me through the initialization process, what start() does, and show me how to store and ask a question in a complete example.",
+      "expected_output": "Full working example showing StixDBEngine(), await engine.start(), await engine.store(), await engine.ask(), and await engine.stop()."
+    },
+    {
+      "id": 2,
+      "prompt": "I want to build a conversational support agent that remembers context across multiple chat turns. Should I use chat(), stream_chat(), or recursive_chat()? Explain the differences and show an example.",
+      "expected_output": "Explanation of three chat modes with code examples, use cases, and when to pick each. Show conversation_id usage for tracking."
+    },
+    {
+      "id": 3,
+      "prompt": "I'm ingesting a large documentation folder and want to ensure the agent can reason effectively over the chunks. What are the best practices for chunk_size, chunk_overlap, and tagging?",
+      "expected_output": "Recommendations for ingest_folder() parameters, explanation of chunk sizing strategy, tagging best practices, and code example."
+    },
+    {
+      "id": 4,
+      "prompt": "My agent stores both specific user interactions (like 'user clicked X at 3pm') and general facts (like 'user prefers dark mode'). How do I design this two-tier storage and query it effectively?",
+      "expected_output": "Pattern showing episodic storage for interactions, semantic storage for extracted facts, then asking that synthesizes both."
+    },
+    {
+      "id": 5,
+      "prompt": "What does trigger_agent_cycle() do? When should I call it and what happens to my memories during a cycle?",
+      "expected_output": "Explanation of agent cycles, what automatic processes run, how summaries are created, timing recommendations, and a working example."
+    },
+    {
+      "id": 6,
+      "prompt": "I'm streaming a chat response and want to handle errors gracefully. Show me the proper try/except structure and what exceptions I should expect.",
+      "expected_output": "Code example with error handling for stream_chat(), common exception types, and recovery patterns."
+    }
+  ]
+}

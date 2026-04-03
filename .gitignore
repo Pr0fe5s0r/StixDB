@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build & distribution
+*.egg-info/
+dist/
+build/
+*.egg
+MANIFEST
+*.whl
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+
+# Mypy / type checkers
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+
+# Ruff
+.ruff_cache/
+
+# Environment files — NEVER commit real credentials
+.env
+.env.local
+.env.*.local
+stix/.env
+
+# IDE / editor
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings
+.claude/
+
+# STIX runtime data
+stix_data/
+stix/stix_data/
+*.db
+
+# Logs
+*.log
+logs/
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+
+# Docker volumes (local dev)
+neo4j_data/
+chroma_data/
+pg_data/
+

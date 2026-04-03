@@ -1,0 +1,30 @@
+{
+  "skill_name": "sdk-memory-layer",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I'm building an agent that needs to remember user preferences. Show me how to store a user's dark mode preference using the SDK, then search for all UI-related preferences the user has mentioned.",
+      "expected_output": "Code examples showing client.memory.store() for storing preference and client.search.create() for finding related memories."
+    },
+    {
+      "id": 2,
+      "prompt": "I have a folder with 50 markdown documentation files and I want to load them all into a StixDB collection so my agent can answer questions about them. What's the best way to do this with the SDK?",
+      "expected_output": "Explanation of ingest_folder() with appropriate parameters, chunk_size recommendations, tagging strategy, and example code."
+    },
+    {
+      "id": 3,
+      "prompt": "My agent is asking 'What products should I recommend?' and I need to get back both the answer and the specific user memories that led to that answer. How do I do this with the SDK?",
+      "expected_output": "Code showing client.query.ask() with top_k parameter, accessing response.sources, and extracting relevance scores."
+    },
+    {
+      "id": 4,
+      "prompt": "I need to bulk import 500 customer facts (name, company, purchase history) into a collection in one operation. What method should I use and how do I organize the items?",
+      "expected_output": "bulk_store() method with items array structure, each item showing content, tier, tags, and node_type fields."
+    },
+    {
+      "id": 5,
+      "prompt": "I'm confused about memory tiers. When should I use 'episodic' vs 'semantic' vs 'procedural'? Give me real examples for each.",
+      "expected_output": "Clear explanation of three tiers with practical examples showing when to use each, differences in how they're searched, and lifecycle."
+    }
+  ]
+}

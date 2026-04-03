@@ -1,0 +1,127 @@
+# =============================================================================
+# StixDB — PRODUCTION Docker Compose Stack
+# =============================================================================
+# Runs: stixdb-engine + Neo4j (graph) + PostgreSQL (metadata) + MinIO (backup)
+#
+# Usage:
+#   docker compose up -d
+#
+# For LOCAL DEVELOPMENT (no Docker required):
+#   pip install "stixdb-engine[local-dev]"
+#   stixdb serve
+#   — or —
+#   .\start-local.ps1   (Windows)
+#   ./start-local.sh    (Linux / macOS)
+# =============================================================================
+version: '3.8'
+
+services:
+  stixdb-engine:
+    build:
+      context: .
+      network: host
+    container_name: stixdb-engine
+    ports:
+      - "4020:4020"
+    env_file:
+      - .env
+    environment:
+      # Storage (Internal Docker network names)
+      - STIXDB_STORAGE_MODE=neo4j
+      - STIXDB_VECTOR_BACKEND=chroma
+      - STIXDB_DATA_DIR=/app/stixdb_data
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=password
+      - STIXDB_SQL_URL=postgresql://stixdb:stixdb_pass@postgres:5432/stixdb
+      
+      # Providers (loaded from .env via env_file above; explicit passthrough with defaults)
+      - STIXDB_LLM_PROVIDER=${STIXDB_LLM_PROVIDER:-openai}
+      - STIXDB_LLM_MODEL=${STIXDB_LLM_MODEL:-gpt-4o}
+      - STIXDB_LLM_CUSTOM_BASE_URL=${STIXDB_LLM_CUSTOM_BASE_URL:-}
+      - STIXDB_LLM_CUSTOM_API_KEY=${STIXDB_LLM_CUSTOM_API_KEY:-}
+
+      - STIXDB_EMBEDDING_PROVIDER=${STIXDB_EMBEDDING_PROVIDER:-sentence_transformers}
+      - STIXDB_EMBEDDING_MODEL=${STIXDB_EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      - STIXDB_EMBEDDING_CUSTOM_BASE_URL=${STIXDB_EMBEDDING_CUSTOM_BASE_URL:-}
+      - STIXDB_EMBEDDING_CUSTOM_API_KEY=${STIXDB_EMBEDDING_CUSTOM_API_KEY:-}
+
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+
+      # API Server
+      - STIXDB_API_KEY=${STIXDB_API_KEY:-}
+      - STIXDB_BACKUP_ENABLED=true
+      - STIXDB_BACKUP_MINIO_ENDPOINT=minio:9000
+      - STIXDB_BACKUP_MINIO_ACCESS_KEY=minioadmin
+      - STIXDB_BACKUP_MINIO_SECRET_KEY=minioadmin
+      - STIXDB_BACKUP_MINIO_BUCKET=stixdb-ingestion
+      - STIXDB_BACKUP_MINIO_SECURE=false
+      - STIXDB_BACKUP_PREFIX=uploads
+      - STIXDB_LOG_LEVEL=INFO
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    volumes:
+      - stixdb_data:/app/stixdb_data
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://localhost:4020/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  neo4j:
+    image: neo4j:5.19
+    container_name: neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/password
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "password", "RETURN 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    volumes:
+      - neo4j_data:/data
+
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=stixdb
+      - POSTGRES_PASSWORD=stixdb_pass
+      - POSTGRES_DB=stixdb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stixdb -d stixdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+
+volumes:
+  stixdb_data:
+  neo4j_data:
+  pg_data:
+  minio_data:
