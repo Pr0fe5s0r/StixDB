@@ -212,8 +212,10 @@ result = client.memory.bulk_store(
 
 ## Ingesting Documents
 
+Automatically parse, chunk, and upload documents to the StixDB server.
+
 ### Upload Single File
-Automatically parse and chunk documents:
+The SDK supports a wide range of text-based and document formats through the StixDB engine:
 
 ```python
 result = client.memory.upload(
@@ -221,22 +223,27 @@ result = client.memory.upload(
     file_path="/path/to/document.pdf",
     
     # Optional parameters
-    tags=["source_document"],
+    tags=["source_document", "manual"],
     chunk_size=1000,          # Characters per chunk
     chunk_overlap=200,        # Overlap between chunks
-    parser="auto",            # auto, pdf, markdown, plain_text, json
+    parser="auto",            # auto, pdf, plain_text, markdown, json
 )
 ```
 
-**Supported formats:**
-- Plain text: `.txt`, `.md`, `.markdown`, `.rst`, `.log`
-- Structured: `.csv`, `.tsv`, `.json`, `.jsonl`, `.yaml`, `.yml`, `.xml`
-- Code: `.py`, `.js`, `.ts`, `.tsx`, `.jsx`, `.java`, `.c`, `.cpp`, `.cs`, `.go`, `.rs`, `.sh`, `.sql`
-- Documents: `.pdf`, `.html`, `.htm`
-- Config: `.toml`, `.ini`, `.cfg`, `.conf`
+**Features:**
+- **Automatic PDF Extraction:** Parses PDF pages and keeps page numbers in the chunk metadata.
+- **Deduplication:** The server uses hashes to ensure identical file chunks are not stored twice in the same collection.
+- **Rich Metadata:** Every chunk stores its `filename`, `filetype`, and `ingested_at` timestamp.
+
+**Supported Formats:**
+- **Plain Text:** `.txt`, `.md`, `.markdown`, `.rst`, `.log`
+- **Structured:** `.csv`, `.tsv`, `.json`, `.jsonl`, `.yaml`, `.yml`, `.xml`
+- **Code:** `.py`, `.js`, `.ts`, `.tsx`, `.jsx`, `.java`, `.c`, `.cpp`, `.cs`, `.go`, `.rs`, `.sh`, `.sql`
+- **Documents:** `.pdf`, `.html`, `.htm`
+- **Config:** `.toml`, `.ini`, `.cfg`, `.conf`
 
 ### Ingest Entire Folder
-Recursively process all supported files in a directory:
+Recursively process and upload all supported files in a directory:
 
 ```python
 result = client.memory.ingest_folder(
@@ -244,9 +251,8 @@ result = client.memory.ingest_folder(
     folder_path="/path/to/docs",
     
     tags=["documentation"],
-    chunk_size=1000,
-    chunk_overlap=200,
-    parser="auto",
+    chunk_size=800,
+    chunk_overlap=150,
     recursive=True,  # Include subdirectories
 )
 ```
@@ -260,20 +266,22 @@ result = client.memory.ingest_folder(
     "files_skipped": 2,
     "ingested": [
         {
-            "filepath": "/path/to/docs/file1.txt",
-            "relative_path": "file1.txt",
-            "result": {...}
+            "filepath": "/path/to/docs/report.pdf",
+            "source_name": "report.pdf",
+            "result": {
+                "node_ids": ["...", "..."],
+                "chunks": 12
+            }
         }
     ],
     "skipped": ["/path/to/docs/unsupported.bin"]
 }
 ```
 
-**Best Practices:**
-- Use `chunk_size=1000` as default; increase for long-form documents, decrease for dense technical docs
-- Set `chunk_overlap=200` to preserve context across chunks
-- Use consistent `tags` to group documents by source or type
-- Use `recursive=True` for folder hierarchies with nested subdirectories
+### Best Practices for Ingestion
+- **Document Type Tuning:** Decrease `chunk_size` (e.g., 600) for highly dense technical specs or code to improve retrieval precision.
+- **Context Preservation:** Always use `chunk_overlap` (at least 15-20% of `chunk_size`) so the agent can bridge topics across chunk boundaries.
+- **Strategic Tagging:** Tag documents by version, department, or source type to enable powerful filtering during `client.query.ask()`.
 
 ---
 

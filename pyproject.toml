@@ -61,6 +61,10 @@ stixdb = "stixdb.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["stixdb"]
+exclude = [
+    "stixdb/stix_data",
+    "stixdb/.env",
+]
 
 [tool.ruff]
 line-length = 100
