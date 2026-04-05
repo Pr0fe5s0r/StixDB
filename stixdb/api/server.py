@@ -39,9 +39,25 @@ async def lifespan(app: FastAPI):
       3. Environment variables / defaults
     """
     global engine
+    import logging
     config = StixDBConfig.load()   # smart loader: file → env → defaults
     engine = StixDBEngine(config=config)
-    await engine.start()
+    try:
+        await engine.start()
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "not enough space" in msg or "Error 112" in msg or "No space left" in msg:
+            logging.critical(
+                "StixDB startup failed — DISK FULL.\n"
+                f"  Storage path: {config.storage.data_dir}\n"
+                "  Free up disk space or change 'storage.path' in ~/.stixdb/config.json."
+            )
+        else:
+            logging.critical("StixDB engine failed to start: %s", exc)
+        raise
+    except Exception as exc:
+        logging.critical("StixDB engine failed to start: %s", exc)
+        raise
     app.state.engine = engine
     yield
     await engine.stop()
