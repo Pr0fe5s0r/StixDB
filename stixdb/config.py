@@ -407,7 +407,12 @@ class StixDBConfig(BaseModel):
             "neo4j":  StorageMode.NEO4J,
         }
         storage_mode = storage_mode_map.get(cf.storage.mode, StorageMode.KUZU)
-        data_dir = cf.storage.path
+
+        # Resolve relative/home-relative storage paths against ~/.stixdb/ so
+        # data survives daemon restarts regardless of the process working directory.
+        from pathlib import Path as _Path
+        _raw = _Path(cf.storage.path).expanduser()
+        data_dir = str(_raw if _raw.is_absolute() else _Path.home() / ".stixdb" / _raw)
 
         base.storage = StorageConfig(
             mode=storage_mode,

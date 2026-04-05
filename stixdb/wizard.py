@@ -242,7 +242,7 @@ def _step_storage() -> StorageFileConfig:
         border_style="cyan", padding=(0, 2),
     ))
 
-    path = Prompt.ask("  Data directory", default="./stixdb_data").strip()
+    path = Prompt.ask("  Data directory", default="~/.stixdb/data").strip()
     return StorageFileConfig(mode="kuzu", path=path)
 
 
