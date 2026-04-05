@@ -380,11 +380,32 @@ class StixDBEngine:
             return chunks
 
         existing_nodes = await graph.list_nodes(limit=20000)
-        existing_chunk_keys = {
-            ((node.metadata or {}).get("document_hash"), (node.metadata or {}).get("chunk"))
+
+        # ── Step 1: Delete all existing chunks from the same source file ──────
+        # Deduplication by (document_hash, chunk_index) breaks whenever the file
+        # is modified — the hash changes, so old chunks linger as duplicates.
+        # Instead: treat re-ingestion of a source as a full replace.
+        if source_name:
+            stale = [n for n in existing_nodes if n.source == source_name]
+            for n in stale:
+                await graph.delete_node(n.id)
+            if stale:
+                logger.info(
+                    "Replaced stale chunks for source",
+                    source=source_name,
+                    deleted=len(stale),
+                    collection=collection,
+                )
+
+        # ── Step 2: Build content-hash set for cross-source dedup guard ───────
+        # Prevents identical chunk text from being stored twice even from
+        # different source paths (e.g. copied files).
+        existing_content_hashes = {
+            (node.metadata or {}).get("content_hash")
             for node in existing_nodes
-            if (node.metadata or {}).get("document_hash")
+            if (node.metadata or {}).get("content_hash")
         }
+
         ingested_at = time.time()
         extraction = extract_document_segments(filepath, parser=parser)
 
@@ -422,10 +443,11 @@ class StixDBEngine:
                 })
                 chunk_index += 1
 
+        # Secondary guard: skip chunks whose exact content already exists
+        # (catches identical chunks from other sources / LangChain doc re-use)
         items = [
             item for item in items
-            if (item["metadata"].get("document_hash"), item["metadata"].get("chunk"))
-            not in existing_chunk_keys
+            if item["metadata"].get("content_hash") not in existing_content_hashes
         ]
 
         if not items:
