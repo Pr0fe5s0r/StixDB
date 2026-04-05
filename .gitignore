@@ -40,6 +40,7 @@ dmypy.json
 .env.local
 .env.*.local
 stix/.env
+cookbooks/**/.env
 
 # IDE / editor
 .vscode/
