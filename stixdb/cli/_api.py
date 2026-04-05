@@ -203,6 +203,97 @@ def _ingest_file(
     )
 
 
+def _build_ignore_filter(folderpath: Path):
+    """
+    Return a callable(Path) -> bool that is True when a file should be skipped.
+
+    Respects .gitignore files (root, parent git root, and subdirectories) via
+    pathspec.  Falls back to a basic fnmatch parser when pathspec is absent.
+    Either way, a hard-coded set of heavy directories (node_modules, .git,
+    __pycache__, dist, build, .next, …) is always ignored.
+    """
+    import fnmatch
+
+    ALWAYS_IGNORE_DIRS = {
+        "node_modules", ".git", "__pycache__", ".venv", "venv", "env",
+        ".tox", "dist", "build", ".next", ".nuxt", "out", ".output",
+        ".cache", ".parcel-cache", "coverage", ".nyc_output",
+        "target", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+        ".idea", ".vscode", "eggs", ".eggs",
+    }
+
+    # ── Collect patterns from .gitignore files ────────────────────────────────
+    # Walk upward from folderpath to find the git root; collect every .gitignore
+    # on the way (patterns from parent repos apply to all paths inside).
+    all_patterns: list[str] = []
+
+    check = folderpath
+    for _ in range(8):
+        gi = check / ".gitignore"
+        if gi.exists():
+            try:
+                lines = gi.read_text(encoding="utf-8", errors="replace").splitlines()
+                if check == folderpath:
+                    all_patterns.extend(lines)
+                else:
+                    # Parent .gitignore: only non-rooted patterns apply everywhere
+                    all_patterns.extend(l for l in lines if not l.strip().startswith("/"))
+            except Exception:
+                pass
+        if (check / ".git").is_dir():
+            break
+        parent = check.parent
+        if parent == check:
+            break
+        check = parent
+
+    # Sub-directory .gitignore files — prefix patterns with their sub-path
+    for sub_gi in folderpath.rglob(".gitignore"):
+        if sub_gi.parent == folderpath:
+            continue  # already added above
+        try:
+            sub_dir = sub_gi.parent.relative_to(folderpath).as_posix()
+            for line in sub_gi.read_text(encoding="utf-8", errors="replace").splitlines():
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#") and not stripped.startswith("!"):
+                    all_patterns.append(f"{sub_dir}/{stripped.lstrip('/')}")
+        except Exception:
+            pass
+
+    # ── Build matcher ─────────────────────────────────────────────────────────
+    try:
+        import pathspec
+        spec = pathspec.PathSpec.from_lines("gitwildmatch", all_patterns)
+
+        def is_ignored(p: Path) -> bool:
+            parts = p.relative_to(folderpath).parts
+            if any(part in ALWAYS_IGNORE_DIRS or part.endswith(".egg-info") for part in parts):
+                return True
+            return spec.match_file(p.relative_to(folderpath).as_posix())
+
+    except ImportError:
+        # Fallback: basic fnmatch — handles the most common patterns
+        def is_ignored(p: Path) -> bool:  # type: ignore[misc]
+            parts = p.relative_to(folderpath).parts
+            if any(part in ALWAYS_IGNORE_DIRS or part.endswith(".egg-info") for part in parts):
+                return True
+            rel = p.relative_to(folderpath).as_posix()
+            for pattern in all_patterns:
+                pattern = pattern.strip()
+                if not pattern or pattern.startswith("#") or pattern.startswith("!"):
+                    continue
+                clean = pattern.lstrip("/")
+                if fnmatch.fnmatch(p.name, clean):
+                    return True
+                if fnmatch.fnmatch(rel, clean):
+                    return True
+                if "/" not in clean and any(fnmatch.fnmatch(part, clean) for part in parts):
+                    return True
+            return False
+
+    return is_ignored
+
+
 def _ingest_folder(
     base: str,
     collection: str,
@@ -231,11 +322,12 @@ def _ingest_folder(
         ".pdf",
     }
 
-    # ── 1. Walk directory ────────────────────────────────────────────────────
+    # ── 1. Walk directory (respecting .gitignore) ────────────────────────────
+    is_ignored = _build_ignore_filter(folderpath)
     pattern = "**/*" if recursive else "*"
     all_files = sorted([
         p for p in folderpath.glob(pattern)
-        if p.is_file() and p.suffix.lower() in SUPPORTED
+        if p.is_file() and p.suffix.lower() in SUPPORTED and not is_ignored(p)
     ])
 
     if not all_files:
@@ -292,10 +384,11 @@ def _ingest_folder(
     )
     task_id = overall.add_task("", total=len(all_files), chunks="0")
 
+    gitignore_note = "[dim]· .gitignore ✓[/dim]" if (folderpath / ".gitignore").exists() else ""
     header = Panel(
         f"[bold]{folderpath.as_posix()}[/bold]  →  [cyan]{collection}[/cyan]\n"
         f"[dim]tags: {', '.join(tags) if tags else '—'}  ·  "
-        f"chunk_size={chunk_size}  ·  {len(all_files)} files[/dim]",
+        f"chunk_size={chunk_size}  ·  {len(all_files)} files[/dim]  {gitignore_note}",
         border_style="cyan",
         padding=(0, 2),
     )
