@@ -41,11 +41,11 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-org/stixdb"
-Repository = "https://github.com/your-org/stixdb"
-Documentation = "https://github.com/your-org/stixdb/blob/main/sdk/README.md"
-"Bug Tracker" = "https://github.com/your-org/stixdb/issues"
-Changelog = "https://github.com/your-org/stixdb/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/Pr0fe5s0r/StixDB"
+Repository = "https://github.com/Pr0fe5s0r/StixDB"
+Documentation = "https://github.com/Pr0fe5s0r/StixDB/blob/main/sdk/README.md"
+"Bug Tracker" = "https://github.com/Pr0fe5s0r/StixDB/issues"
+Changelog = "https://github.com/Pr0fe5s0r/StixDB/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/stixdb_sdk"]

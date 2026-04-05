@@ -58,7 +58,7 @@ asyncio.run(main())
 ## How the Three Modes Work
 
 ### Mode 1 — No API Key (Heuristic Search)
-`LLMProvider.NONE` activates **heuristic mode**. You can still store and search memories — you just don't get AI-synthesized answers.
+`LLMProvider.NONE` activates **heuristic mode**. Note: the LLM is responsible for the internal memory organization (merging, summarizing, and maintaining nodes) — setting this to `NONE` disables that background intelligence. You can still store and retrieve memories, but the graph will not be autonomously organized or synthesized.
 
 **Exactly what it does:** The engine retrieves the top-K semantically similar nodes using **cosine similarity** on 384-dim sentence embeddings, then re-ranks them by their `importance` score. The result is an ordered list of matching facts — fast, accurate, and completely free.
 

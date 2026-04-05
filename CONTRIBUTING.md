@@ -14,8 +14,8 @@ Thanks for your interest — all contributions are welcome: bug reports, feature
 ### Setup
 
 ```bash
-git clone https://github.com/your-org/stix.git
-cd stix
+git clone https://github.com/Pr0fe5s0r/StixDB.git
+cd StixDB
 
 python -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
@@ -68,14 +68,14 @@ doc/                Architecture and performance documentation
 
 ### Reporting a bug
 
-Open a [GitHub Issue](https://github.com/your-org/stix/issues/new?template=bug_report.md) with:
+Open a [GitHub Issue](https://github.com/Pr0fe5s0r/StixDB/issues/new?template=bug_report.md) with:
 - Reproduction steps (minimal code)
 - Your environment (Python version, storage/vector backend, OS)
 - Full stack trace
 
 ### Requesting a feature
 
-Open a [GitHub Issue](https://github.com/your-org/stix/issues/new?template=feature_request.md) describing the problem and your proposed solution.
+Open a [GitHub Issue](https://github.com/Pr0fe5s0r/StixDB/issues/new?template=feature_request.md) describing the problem and your proposed solution.
 
 ### Submitting a pull request
 

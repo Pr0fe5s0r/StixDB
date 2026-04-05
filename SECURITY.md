@@ -4,7 +4,7 @@
 
 **Please do not report security vulnerabilities through public GitHub issues.**
 
-If you discover a security vulnerability in StixDB, please report it by opening a [GitHub Security Advisory](https://github.com/your-org/stix/security/advisories/new). This keeps the report private while we investigate.
+If you discover a security vulnerability in StixDB, please report it by opening a [GitHub Security Advisory](https://github.com/Pr0fe5s0r/StixDB/security/advisories/new). This keeps the report private while we investigate.
 
 Alternatively, email **security@your-org.com** with:
 

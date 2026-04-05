@@ -37,8 +37,8 @@ docker compose version
 ### 1. Clone or download the repository
 
 ```bash
-git clone https://github.com/your-org/stixdb.git
-cd stixdb
+git clone https://github.com/Pr0fe5s0r/StixDB.git
+cd StixDB
 ```
 
 ### 2. Copy and configure the environment file

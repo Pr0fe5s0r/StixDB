@@ -195,7 +195,7 @@ Use this when your application runs in the same Python process and you want the 
 
 Primary entry point:
 
-- `stix.engine.StixDBEngine`
+- `stixdb.engine.StixDBEngine`
 
 Key methods include:
 

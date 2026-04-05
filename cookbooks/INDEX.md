@@ -4,6 +4,25 @@ A comprehensive guide to all cookbooks for building applications with StixDB.
 
 ## 📚 Cookbook Categories
 
+### Comparison — Legacy vs StixDB
+**See the difference with runnable benchmarks**
+
+- [`comparison/legacy_vs_stixdb.py`](comparison/legacy_vs_stixdb.py) — Side-by-side: Plain List vs Naive Vector Store vs StixDB across 4 scenarios
+
+**→ Start here if you want to see why StixDB beats basic RAG**
+
+---
+
+### Vibecoding — Shared Agent Memory
+**Persistent memory for LLM-assisted coding sessions**
+
+- [`vibecoding/shared_memory.py`](vibecoding/shared_memory.py) — CLI + Python class for shared memory across agents and sessions
+- [`vibecoding/CLAUDE.md`](vibecoding/CLAUDE.md) — Instructions for Claude Code: when and how to call the memory script
+
+**→ Start here if you're using Claude Code, Cursor, or any LLM coding agent**
+
+---
+
 ### Core SDK & Engine
 **Learn the fundamentals of StixDB**
 
