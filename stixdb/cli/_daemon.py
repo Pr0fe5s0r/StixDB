@@ -213,7 +213,7 @@ def daemon_status():
         r = httpx.get(
             f"{url}/health",
             headers={"X-API-Key": api_key} if api_key else {},
-            timeout=5,
+            timeout=30,
         )
         if r.status_code == 200:
             api_ok = True

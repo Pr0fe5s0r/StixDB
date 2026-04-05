@@ -76,23 +76,27 @@ def server_url(host: str, port: int) -> str:
     return f"http://{host}:{port}"
 
 
-def http_get(url: str, api_key: Optional[str] = None) -> dict:
+def http_get(url: str, api_key: Optional[str] = None, timeout: int = 60) -> dict:
     import httpx
     headers = {"X-API-Key": api_key} if api_key else {}
     try:
-        r = httpx.get(url, headers=headers, timeout=10)
+        r = httpx.get(url, headers=headers, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except httpx.ConnectError:
         console.print(f"[red]✗[/red] Cannot reach server at [bold]{url}[/bold]")
         console.print("  Start one with [cyan]stixdb serve[/cyan] or [cyan]stixdb daemon start[/cyan].")
         raise typer.Exit(1)
+    except httpx.ReadTimeout:
+        console.print(f"[red]✗[/red] Server timed out after {timeout}s: [bold]{url}[/bold]")
+        console.print("  The server is busy or the collection is loading. Try again in a moment.")
+        raise typer.Exit(1)
     except httpx.HTTPStatusError as exc:
         console.print(f"[red]HTTP {exc.response.status_code}:[/red] {exc.response.text}")
         raise typer.Exit(1)
 
 
-def http_post(url: str, payload: dict, api_key: Optional[str] = None) -> dict:
+def http_post(url: str, payload: dict, api_key: Optional[str] = None, timeout: int = 120) -> dict:
     import httpx
     headers = (
         {"X-API-Key": api_key, "Content-Type": "application/json"}
@@ -100,27 +104,34 @@ def http_post(url: str, payload: dict, api_key: Optional[str] = None) -> dict:
         else {"Content-Type": "application/json"}
     )
     try:
-        r = httpx.post(url, json=payload, headers=headers, timeout=120)
+        r = httpx.post(url, json=payload, headers=headers, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except httpx.ConnectError:
         console.print(f"[red]✗[/red] Cannot reach server at [bold]{url}[/bold]")
         console.print("  Start one with [cyan]stixdb serve[/cyan] or [cyan]stixdb daemon start[/cyan].")
         raise typer.Exit(1)
+    except httpx.ReadTimeout:
+        console.print(f"[red]✗[/red] Server timed out after {timeout}s: [bold]{url}[/bold]")
+        console.print("  The server is busy. Try again in a moment.")
+        raise typer.Exit(1)
     except httpx.HTTPStatusError as exc:
         console.print(f"[red]HTTP {exc.response.status_code}:[/red] {exc.response.text}")
         raise typer.Exit(1)
 
 
-def http_delete(url: str, api_key: Optional[str] = None) -> dict:
+def http_delete(url: str, api_key: Optional[str] = None, timeout: int = 60) -> dict:
     import httpx
     headers = {"X-API-Key": api_key} if api_key else {}
     try:
-        r = httpx.delete(url, headers=headers, timeout=30)
+        r = httpx.delete(url, headers=headers, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except httpx.ConnectError:
         console.print(f"[red]✗[/red] Cannot reach server at [bold]{url}[/bold]")
+        raise typer.Exit(1)
+    except httpx.ReadTimeout:
+        console.print(f"[red]✗[/red] Server timed out after {timeout}s: [bold]{url}[/bold]")
         raise typer.Exit(1)
     except httpx.HTTPStatusError as exc:
         console.print(f"[red]HTTP {exc.response.status_code}:[/red] {exc.response.text}")
