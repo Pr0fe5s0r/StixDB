@@ -213,19 +213,171 @@ def _ingest_folder(
     recursive: bool,
     api_key: Optional[str],
 ) -> None:
-    payload = {
-        "folder_path": str(folderpath),
-        "tags": tags,
-        "chunk_size": chunk_size,
-        "chunk_overlap": chunk_overlap,
-        "recursive": recursive,
-        "parser": "auto",
+    import threading
+    import time
+    import httpx
+    from rich.live import Live
+    from rich.table import Table
+    from rich.progress import Progress, BarColumn, MofNCompleteColumn, TextColumn
+    from rich.panel import Panel
+    from rich.console import Group
+
+    SUPPORTED = {
+        ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".c", ".cpp", ".cs",
+        ".go", ".rs", ".sh", ".sql", ".rb", ".php", ".swift", ".kt",
+        ".md", ".markdown", ".rst", ".txt", ".log",
+        ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini", ".xml",
+        ".csv", ".tsv", ".html", ".htm", ".css", ".scss", ".sass",
+        ".pdf",
     }
-    console.print(f"  Ingesting [bold]{folderpath}[/bold] → [cyan]{collection}[/cyan]…")
-    data = http_post(f"{base}/collections/{collection}/ingest/folder", payload, api_key)
-    files = data.get("files_processed", data.get("file_count", "?"))
-    total = data.get("total_chunks", data.get("ingested_chunks", "?"))
-    console.print(f"[green]✓[/green] {files} files  ·  {total} chunks  →  [cyan]{collection}[/cyan]")
+
+    # ── 1. Walk directory ────────────────────────────────────────────────────
+    pattern = "**/*" if recursive else "*"
+    all_files = sorted([
+        p for p in folderpath.glob(pattern)
+        if p.is_file() and p.suffix.lower() in SUPPORTED
+    ])
+
+    if not all_files:
+        console.print(f"[yellow]No supported files found in {folderpath}[/yellow]")
+        return
+
+    # ── 2. State table ───────────────────────────────────────────────────────
+    # Each entry: status ∈ waiting | uploading | done | error | skipped
+    states: list[dict] = [
+        {"status": "waiting", "chunks": 0, "error": None}
+        for _ in all_files
+    ]
+
+    SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def _rel(p: Path) -> str:
+        rel = p.relative_to(folderpath).as_posix()
+        return ("…" + rel[-47:]) if len(rel) > 50 else rel
+
+    def _file_table(spin: str) -> Table:
+        t = Table(box=box.SIMPLE, show_header=False, padding=(0, 1),
+                  expand=False, show_edge=False)
+        t.add_column("file", no_wrap=True, min_width=50)
+        t.add_column("status", width=16, no_wrap=True)
+        t.add_column("info", justify="right", width=10, no_wrap=True)
+
+        for fpath, state in zip(all_files, states):
+            rel = _rel(fpath)
+            s = state["status"]
+            if s == "waiting":
+                t.add_row(f"[dim]{rel}[/dim]", "[dim]· waiting[/dim]", "")
+            elif s == "uploading":
+                t.add_row(f"[bold white]{rel}[/bold white]",
+                          f"[yellow]{spin} uploading[/yellow]", "")
+            elif s == "done":
+                t.add_row(rel,
+                          "[green]✓ done[/green]",
+                          f"[dim]{state['chunks']} chunks[/dim]")
+            elif s == "error":
+                t.add_row(f"[red]{rel}[/red]",
+                          "[red]✗ error[/red]", "")
+            else:
+                t.add_row(f"[dim]{rel}[/dim]", "[dim]— skipped[/dim]", "")
+        return t
+
+    overall = Progress(
+        TextColumn("  "),
+        BarColumn(bar_width=45, complete_style="green", finished_style="green"),
+        MofNCompleteColumn(),
+        TextColumn("[dim]files[/dim]"),
+        TextColumn("  ·  "),
+        TextColumn("[green]{task.fields[chunks]}[/green]"),
+        TextColumn("[dim]chunks[/dim]"),
+    )
+    task_id = overall.add_task("", total=len(all_files), chunks="0")
+
+    header = Panel(
+        f"[bold]{folderpath.as_posix()}[/bold]  →  [cyan]{collection}[/cyan]\n"
+        f"[dim]tags: {', '.join(tags) if tags else '—'}  ·  "
+        f"chunk_size={chunk_size}  ·  {len(all_files)} files[/dim]",
+        border_style="cyan",
+        padding=(0, 2),
+    )
+
+    # ── 3. Upload each file with animated display ────────────────────────────
+    upload_url = f"{base}/collections/{collection}/upload"
+    http_headers = {"X-API-Key": api_key} if api_key else {}
+    done_count = 0
+    total_chunks = 0
+    spin_idx = 0
+
+    with Live(console=console, refresh_per_second=15) as live:
+
+        def _render():
+            live.update(Group(
+                header,
+                _file_table(SPIN[spin_idx % len(SPIN)]),
+                overall,
+            ))
+
+        _render()
+
+        for i, fpath in enumerate(all_files):
+            states[i]["status"] = "uploading"
+
+            # Upload in background thread so spinner can animate
+            result: dict = {}
+
+            def _upload(fp=fpath, res=result):
+                try:
+                    with open(fp, "rb") as fh:
+                        r = httpx.post(
+                            upload_url,
+                            files={"file": (fp.name, fh, "application/octet-stream")},
+                            data={
+                                "tags": ",".join(tags),
+                                "chunk_size": str(chunk_size),
+                                "chunk_overlap": str(chunk_overlap),
+                            },
+                            headers=http_headers,
+                            timeout=300,
+                        )
+                    r.raise_for_status()
+                    d = r.json()
+                    res["ok"] = True
+                    res["chunks"] = d.get("ingested_chunks", 0)
+                except Exception as exc:
+                    res["ok"] = False
+                    res["error"] = str(exc)
+
+            t = threading.Thread(target=_upload, daemon=True)
+            t.start()
+
+            while t.is_alive():
+                spin_idx += 1
+                _render()
+                time.sleep(0.07)
+
+            t.join()
+
+            if result.get("ok"):
+                chunks = result.get("chunks", 0)
+                states[i]["status"] = "done"
+                states[i]["chunks"] = chunks
+                total_chunks += chunks
+                done_count += 1
+            else:
+                states[i]["status"] = "error"
+                states[i]["error"] = result.get("error", "unknown error")
+
+            overall.update(task_id, completed=done_count, chunks=str(total_chunks))
+            _render()
+
+        # Final settled frame
+        _render()
+
+    skipped = len(all_files) - done_count
+    console.print(
+        f"\n[green]✓[/green]  [bold]{done_count}[/bold] files ingested  ·  "
+        f"[bold green]{total_chunks}[/bold green] chunks  →  [cyan]{collection}[/cyan]"
+        + (f"  [dim]({skipped} failed/skipped)[/dim]" if skipped else "")
+    )
 
 
 # ── store ──────────────────────────────────────────────────────────────────────
