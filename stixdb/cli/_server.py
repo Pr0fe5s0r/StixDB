@@ -105,7 +105,7 @@ def cmd_serve(
     """
     import uvicorn
     require_global_config()
-    os.environ["STIXDB_PROJECT_DIR"] = str(GLOBAL_DIR)
+    os.environ["STIXDB_PROJECT_DIR"] = str(GLOBAL_DIR.parent)
 
     try:
         from stixdb.config import ConfigFile

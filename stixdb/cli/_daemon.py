@@ -100,7 +100,7 @@ def daemon_start(
     if port == 0:
         port = (cf.server.port if cf else None) or 4020
 
-    os.environ["STIXDB_PROJECT_DIR"] = str(GLOBAL_DIR)
+    os.environ["STIXDB_PROJECT_DIR"] = str(GLOBAL_DIR.parent)
     os.environ["STIXDB_DAEMON_MODE"] = "1"
     dh = "localhost" if host == "0.0.0.0" else host
 
@@ -123,7 +123,7 @@ def daemon_start(
     import subprocess
     # os.environ already has ~/.stixdb/.env loaded above; copy it all to subprocess
     env = os.environ.copy()
-    env["STIXDB_PROJECT_DIR"] = str(GLOBAL_DIR)
+    env["STIXDB_PROJECT_DIR"] = str(GLOBAL_DIR.parent)
     env["STIXDB_DAEMON_MODE"] = "1"
 
     with open(DAEMON_LOG, "a") as log_fh:
