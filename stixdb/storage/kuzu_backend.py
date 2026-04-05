@@ -18,6 +18,7 @@ Schema (created automatically on first run):
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 from typing import Optional
@@ -90,6 +91,37 @@ CREATE NODE TABLE IF NOT EXISTS MemoryCluster (
 """
 
 
+def _encode_embedding(embedding_data: list) -> str:
+    """Encode embedding as base64 binary (float32). ~4.5x smaller than JSON text."""
+    if not embedding_data:
+        return ""
+    import numpy as np
+    arr = np.array(embedding_data, dtype="float32")
+    return base64.b64encode(arr.tobytes()).decode("ascii")
+
+
+def _decode_embedding(raw: str):
+    """Decode embedding — handles base64 binary (new) and JSON text (legacy)."""
+    if not raw:
+        return None
+    import numpy as np
+    # Try base64 binary first (new format)
+    try:
+        arr = np.frombuffer(base64.b64decode(raw.encode("ascii")), dtype="float32").copy()
+        if arr.size > 0:
+            return arr
+    except Exception:
+        pass
+    # Fallback: legacy JSON text format
+    try:
+        data = json.loads(raw)
+        if data:
+            return np.array(data, dtype="float32")
+    except Exception:
+        pass
+    return None
+
+
 def _node_to_row(node: MemoryNode) -> dict:
     # Handle embedding: could be list or numpy array
     embedding_data = []
@@ -111,7 +143,7 @@ def _node_to_row(node: MemoryNode) -> dict:
         "source_agent_id": node.source_agent_id or "",
         "tags": json.dumps(node.tags or []),
         "metadata": json.dumps(node.metadata or {}),
-        "embedding": json.dumps(embedding_data),
+        "embedding": _encode_embedding(embedding_data),
         "parent_node_ids": json.dumps(node.parent_node_ids or []),
         "pinned": bool(node.pinned),
         "created_at": float(node.created_at),
@@ -122,9 +154,7 @@ def _node_to_row(node: MemoryNode) -> dict:
 
 
 def _row_to_node(row: dict) -> MemoryNode:
-    import numpy as np
-    emb_raw = json.loads(row.get("embedding") or "[]")
-    embedding = np.array(emb_raw, dtype="float32") if emb_raw else None
+    embedding = _decode_embedding(row.get("embedding") or "")
     return MemoryNode(
         id=row["id"],
         collection=row["collection"],
@@ -238,6 +268,7 @@ class KuzuBackend(StorageBackend):
         self._conn = kuzu.Connection(self._db)
         self._lock = asyncio.Lock()
         self._initialized = False
+        self._upsert_count = 0
         logger.info("KuzuDB backend created", db_path=db_file_path)
 
     # ------------------------------------------------------------------ #
@@ -281,8 +312,11 @@ class KuzuBackend(StorageBackend):
         logger.debug("KuzuDB collection ready", collection=collection)
 
     async def close(self) -> None:
-        # KuzuDB connection is closed when the object is garbage-collected;
-        # explicit close is not required but we log it.
+        async with self._lock:
+            try:
+                self._conn.execute("CHECKPOINT")
+            except Exception:
+                pass
         logger.info("KuzuDB backend closed")
 
     async def list_collections(self) -> list[str]:
@@ -317,6 +351,12 @@ class KuzuBackend(StorageBackend):
         row = _node_to_row(node)
         async with self._lock:
             self._ensure_schema()
+            self._upsert_count += 1
+            if self._upsert_count % 500 == 0:
+                try:
+                    self._conn.execute("CHECKPOINT")
+                except Exception:
+                    pass
             # Check if it already exists
             existing = self._exec(
                 "MATCH (n:MemoryNode {id: $id}) RETURN n.id",
