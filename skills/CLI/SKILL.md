@@ -39,6 +39,208 @@ If you skip step 4, everything you just learned is lost the moment this session 
 
 ---
 
+## The Most Important Rule: Store Full Discovery, Not References
+
+> **This is the number one failure mode of agents using StixDB.**
+> Storing a short reference like "Fixed bug in worker.py" or "Updated config schema" is useless.
+> It tells the next agent nothing. It forces the next agent to re-read all the same files,
+> re-trace the same execution paths, and re-discover the same things. That is exactly what
+> StixDB exists to prevent.
+
+**The goal of every store operation is to make the next agent's re-discovery completely unnecessary.**
+Store enough that an agent starting a brand new session — with zero context window — can read your
+StixDB entries and immediately know what you know, without opening a single file.
+
+### The Test
+
+Before you store anything, ask yourself:
+
+> "If the next agent reads only this StixDB entry and nothing else, can they continue
+> work immediately without re-investigating?"
+
+If the answer is no, your entry is not detailed enough. Add more.
+
+---
+
+## What Good vs Bad Storage Looks Like
+
+### Bug Fix
+
+**BAD — useless reference:**
+```bash
+stixdb store "Fixed empty collection bug in worker.py" -c proj_stixdb
+```
+
+**GOOD — full discovery stored:**
+```bash
+stixdb store "BUG FIXED: agent worker was running full perceive/plan/act cycle even when \
+collection had zero nodes, causing cycle spam every 30s in daemon logs (cycle=1,2,3... \
+with all zeros). ROOT CAUSE: _run_cycle() in stixdb/agent/worker.py had no guard for \
+empty collections. FIX: added node_count = await self.graph.count_nodes() at line 150, \
+early return if node_count == 0 with a debug-level log. graph.count_nodes() method is \
+at stixdb/graph/memory_graph.py:146. The fix does NOT increment cycle_count so logs stay \
+clean. Verified: after fix, logs show no cycle entries until data is ingested." \
+  -c proj_stixdb --tags bugfix,worker,agent --importance 0.9
+```
+
+---
+
+### Architecture Discovery
+
+**BAD:**
+```bash
+stixdb store "CLI was refactored into a package" -c proj_stixdb
+```
+
+**GOOD:**
+```bash
+stixdb store "ARCHITECTURE: stixdb/cli.py (1200 lines, 4 commands) was split into \
+stixdb/cli/ package. Structure: __init__.py (app assembly, registers all commands), \
+_helpers.py (shared: GLOBAL_DIR, GLOBAL_CONFIG, DAEMON_PID, DAEMON_LOG path constants, \
+http_get/post/delete helpers, daemon_running(), require_global_config()), \
+_server.py (cmd_init, cmd_serve, cmd_status, cmd_info), \
+_daemon.py (daemon_app sub-typer: start/stop/restart/status/logs), \
+_api.py (collections_app sub-typer + cmd_ingest, cmd_store, cmd_search, cmd_ask). \
+Entry point in pyproject.toml: stixdb = 'stixdb.cli:app'. \
+All API commands read host/port/api_key from ~/.stixdb/config.json via _helpers." \
+  -c proj_stixdb --tags architecture,cli,refactor --importance 0.9
+```
+
+---
+
+### Decision Made
+
+**BAD:**
+```bash
+stixdb store "Decided to store API keys in config.json" -c proj_stixdb
+```
+
+**GOOD:**
+```bash
+stixdb store "DECISION: API keys stored as plain values directly in config.json \
+(cf.llm.api_key, cf.embedding.api_key, cf.server.api_key), NOT as env var name \
+references. RATIONALE: previous approach stored env var names (e.g. NEBIUS_API_KEY) \
+and called os.getenv() at runtime. This caused a cascade failure: wizard stored the \
+raw key value as an env var name, os.getenv('v1.CmMK...') returned None, server fell \
+back to sentence_transformers for embedding, which triggered a corrupt numexpr install. \
+CONSEQUENCE: anyone with config.json has the keys — file must be kept private, \
+never committed to git. ~/.stixdb/config.json is outside all repos." \
+  -c proj_stixdb --tags decisions,security,api-keys --importance 0.95
+```
+
+---
+
+### Understanding a File or Module
+
+**BAD:**
+```bash
+stixdb store "config.py has ConfigFile and StixDBConfig" -c proj_stixdb
+```
+
+**GOOD:**
+```bash
+stixdb store "MODULE: stixdb/config.py has two config systems. \
+(1) ConfigFile (line ~183) — Pydantic BaseModel, serialised to/from ~/.stixdb/config.json. \
+Contains: LLMFileConfig (provider, model, api_key, base_url, temperature, max_tokens, \
+max_context_nodes, graph_traversal_depth, timeout), EmbeddingFileConfig, StorageFileConfig, \
+IngestionFileConfig, AgentFileConfig (cycle_interval default 300s), \
+ObservabilityFileConfig, ServerFileConfig. Has save() and load() methods. \
+(2) StixDBConfig (line ~282) — runtime config used by the engine. Has from_env() (reads \
+env vars), from_file() (calls _from_config_file()), and load() (smart loader: checks \
+STIXDB_PROJECT_DIR env, falls back to CWD). _from_config_file() translates ConfigFile \
+into StixDBConfig, resolving all keys and preset URLs. These are separate by design: \
+ConfigFile is the on-disk format, StixDBConfig is the in-memory runtime object." \
+  -c proj_stixdb --tags file-map,architecture,config --importance 0.9
+```
+
+---
+
+### In-Progress Work
+
+**BAD:**
+```bash
+stixdb store "Working on wizard changes" -c proj_stixdb
+```
+
+**GOOD:**
+```bash
+stixdb store "IN PROGRESS [2026-04-06]: Updating wizard.py (stixdb/wizard.py). \
+Completed: added _step_agent() as Step 4/5 — cycle_interval (default 300s) asked \
+upfront, all other 7 params gated behind 'Configure advanced agent settings? [N]' \
+confirm. Updated _step_advanced() to return tuple of 4 (added ObservabilityFileConfig). \
+Updated run_wizard() call sequence and ConfigFile construction to pass agent_cfg, obs_cfg. \
+REMAINING: _preview() table not yet updated — needs rows for agent.* and \
+observability.* sections. Also _server.py cmd_info() shows new fields but stixdb info \
+output not verified against live config. Next action: read wizard.py lines 330-380, \
+add the missing preview rows, then run stixdb init --force to test." \
+  -c proj_stixdb --tags in-progress,wizard --importance 0.95
+```
+
+---
+
+## Storage Templates for Coding Agents
+
+Use these templates. Fill in every field. Do not abbreviate.
+
+### Bug Fix Template
+```bash
+stixdb store "BUG FIXED: [symptom observed in logs/output]. \
+ROOT CAUSE: [exact technical explanation — what was wrong and why]. \
+LOCATION: [file:line_number — function name]. \
+FIX: [exactly what code was changed and how]. \
+VERIFIED: [how you confirmed the fix worked]. \
+RELATED: [any other files or functions involved]." \
+  -c COLLECTION --tags bugfix --importance 0.85
+```
+
+### Architecture Discovery Template
+```bash
+stixdb store "ARCHITECTURE: [component name]. \
+LOCATION: [file path, key line numbers]. \
+PURPOSE: [what it does and why it exists]. \
+STRUCTURE: [key classes/functions and what each does]. \
+DEPENDENCIES: [what it imports from / what imports it]. \
+HOW IT CONNECTS: [how it fits into the larger system — data flow, call chain]. \
+GOTCHAS: [non-obvious things that would trip up someone reading it cold]." \
+  -c COLLECTION --tags architecture --importance 0.85
+```
+
+### Decision Template
+```bash
+stixdb store "DECISION: [what was decided]. \
+CONTEXT: [what problem this was solving]. \
+RATIONALE: [why this option over alternatives]. \
+ALTERNATIVES REJECTED: [what else was considered and why it was ruled out]. \
+CONSEQUENCES: [what this means for the codebase going forward — constraints created]. \
+DATE: [YYYY-MM-DD]." \
+  -c COLLECTION --tags decisions --importance 0.9
+```
+
+### In-Progress Template
+```bash
+stixdb store "IN PROGRESS [YYYY-MM-DD]: [feature or task name]. \
+COMPLETED SO FAR: [specific things done, with file:line references]. \
+CURRENT STATE: [exact state of the code right now — what works, what doesn't]. \
+REMAINING: [specific steps left, in order]. \
+NEXT ACTION: [the exact first thing to do when resuming — file to open, function to edit]. \
+BLOCKERS: [anything that is unclear or needs to be resolved first]." \
+  -c COLLECTION --tags in-progress --importance 0.95
+```
+
+### Session Summary Template
+```bash
+stixdb store "SESSION SUMMARY [YYYY-MM-DD]: [one-line description of session]. \
+ACCOMPLISHED: [bullet list of completed items with file references]. \
+DECISIONS MADE: [list of key decisions — link to DECISION entries if already stored]. \
+BUGS FIXED: [list with file:line references]. \
+CURRENT STATE: [where the project stands right now — what works end-to-end]. \
+LEFT OFF AT: [exact stopping point]. \
+NEXT SESSION SHOULD START WITH: [specific first action]." \
+  -c COLLECTION --tags session-summary --importance 0.85
+```
+
+---
+
 ## One-Time Setup
 
 Run once per machine. After this, every agent on this machine has persistent memory.
@@ -50,411 +252,202 @@ stixdb daemon start         # Start the background memory server
 stixdb daemon status        # Verify it's running
 ```
 
-The daemon persists in the background. On subsequent sessions just run `stixdb daemon start` — if
-already running it will say so and exit cleanly.
-
 ---
 
 ## Session Startup — Run This Every Time
 
 ```bash
-# 1. Ensure daemon is running
 stixdb daemon start
+COLL="proj_$(basename $(pwd))"
 
-# 2. Load project context (replace PROJECT with your collection name)
-stixdb ask "What is the current state of this project and where did we leave off?" -c PROJECT
+# Load full project state — not just search, use ask for synthesis
+stixdb ask "What is the current state of this project, what was I working on, \
+  and what should I do next?" -c $COLL --top-k 25 --depth 3
 
-# 3. Check for in-progress work
-stixdb search "in progress work" -c PROJECT --top-k 5
-
-# 4. Check for user preferences relevant to this session
-stixdb search "user preferences style constraints" -c PROJECT --top-k 5
+# Targeted recall
+stixdb search "in progress" -c $COLL --top-k 5
+stixdb search "known issues blockers" -c $COLL --top-k 5
+stixdb search "user preferences" -c $COLL --top-k 3
 ```
 
-Do not proceed with any task until you have completed this checklist.
+Do not open any files or start any work until you have completed this checklist.
 
 ---
 
 ## Session End — Run This Every Time
 
 ```bash
-# 1. Store session summary
-stixdb store "SESSION SUMMARY: [what was worked on, decisions made, outcomes]" \
-  -c PROJECT --tags session-summary,$(date +%Y-%m-%d) --importance 0.85
+COLL="proj_$(basename $(pwd))"
+DATE=$(date +%Y-%m-%d)
 
-# 2. Store in-progress work explicitly
-stixdb store "IN PROGRESS: [exactly where work was left off, what comes next]" \
-  -c PROJECT --tags in-progress --importance 0.95
-
-# 3. Store any new decisions or discoveries
-stixdb store "DECISION: [what was decided and why]" \
-  -c PROJECT --tags decisions --importance 0.85
-
-# 4. Store any bugs found or fixed
-stixdb store "BUG FIXED: [file:line — description of fix]" \
-  -c PROJECT --tags bugs,fixed --importance 0.7
+# Use the IN PROGRESS and SESSION SUMMARY templates above — full detail, not references
+stixdb store "IN PROGRESS [$DATE]: ..." -c $COLL --tags in-progress,$DATE --importance 0.95
+stixdb store "SESSION SUMMARY [$DATE]: ..." -c $COLL --tags session-summary,$DATE --importance 0.85
 ```
 
 ---
 
 ## The Cardinal Rule: One Collection Per Coding Project
 
-> **STRICT RULE — Never mix coding projects into the same collection.**
+> **STRICT — Never mix coding projects into the same collection.**
 
-Every coding project gets its own isolated collection. This is not optional. Mixing projects causes
-the agent to retrieve wrong context, apply decisions from one codebase to another, and produce
-incorrect or dangerous suggestions.
+Every coding project gets its own isolated collection. This is not a suggestion.
 
 ### Naming Convention
 
 ```
-proj_<repo-name>          # e.g. proj_stixdb, proj_payments-api, proj_auth-service
+proj_<repo-name>    →   proj_stixdb   proj_payments-api   proj_auth-service
 ```
 
-### Why This Is Mandatory
+### Why Mixing Projects Breaks Everything
 
-- **Context bleed**: If `proj_stixdb` and `proj_payments-api` share a collection, a search for
-  "database schema" returns results from both — the agent cannot tell which applies.
-- **Decision contamination**: Architecture decisions from one project will pollute reasoning for
-  another. "We use Pydantic v2" might be true for one repo and false for another.
-- **Wrong file paths**: Stored file paths, function names, and line numbers from one project are
-  meaningless in another.
-- **Recall pollution**: Importance scores and pruning apply collection-wide. A critical fact in
-  project A can get buried by the volume of project B.
+- **Context bleed**: searching "database schema" returns results from multiple projects — the agent
+  cannot know which applies to the current task.
+- **Decision contamination**: "We use Pydantic v2" is true for one project, false for another.
+  The agent will apply the wrong decision.
+- **Wrong file paths**: `stixdb/config.py:183` means nothing in a different codebase.
+- **Corrupted reasoning**: `stixdb ask` synthesises across all nodes in a collection. Mixing
+  projects means the LLM reasons over two codebases at once and produces incoherent answers.
 
-### Setting Up a New Project Collection
+### New Project Setup
 
 ```bash
-# First time in a new project directory
-PROJECT=$(basename $(pwd))   # e.g. "stixdb"
-COLLECTION="proj_${PROJECT}"
+COLL="proj_$(basename $(pwd))"
 
-# Ingest key files so you understand the project
-stixdb ingest ./README.md -c $COLLECTION --tags overview --importance 0.9
-stixdb ingest ./docs/ -c $COLLECTION --tags documentation
-stixdb ingest ./src/ -c $COLLECTION --tags source-code --chunk-size 600
-# Or if Python:
-stixdb ingest ./ -c $COLLECTION --tags source-code --chunk-size 600
+# Ingest codebase first so StixDB understands the project
+stixdb ingest ./README.md -c $COLL --tags overview --importance 0.9
+stixdb ingest ./ -c $COLL --tags source-code --chunk-size 600
 
-# Store initial project facts
-stixdb store "Project: $PROJECT — initial ingestion on $(date +%Y-%m-%d)" \
-  -c $COLLECTION --tags setup --importance 0.8
+# Store what you learn from your initial read — use the ARCHITECTURE template
+stixdb store "ARCHITECTURE: [full description of entry point, key modules, patterns]" \
+  -c $COLL --tags architecture --importance 0.9
 
-# Orient yourself
-stixdb ask "What is this project, what does it do, and how is it structured?" -c $COLLECTION
+# Orient yourself using stored context
+stixdb ask "What is this project, what does it do, and how is it structured?" \
+  -c $COLL --top-k 20 --depth 3
 ```
 
 ---
 
 ## Core Commands
 
-### Store a Memory
-
+### Store
 ```bash
 stixdb store "TEXT" -c COLLECTION --tags TAGS --importance 0.8 --node-type TYPE
 ```
 
-| Option | Values | Default |
-|--------|--------|---------|
-| `-c` / `--collection` | any name | `main` |
-| `--tags` / `-t` | comma-separated | none |
-| `--importance` | 0.0–1.0 | 0.5 |
-| `--node-type` | `fact` `concept` `goal` `rule` `pattern` | `fact` |
-
-### Search (Semantic Recall)
-
+### Search (semantic recall)
 ```bash
 stixdb search "QUERY" -c COLLECTION --top-k 10 --depth 2 --threshold 0.2
 ```
 
-Returns the most semantically relevant memories. Lower `--threshold` for broader recall.
-
-### Ask (LLM Reasoning over Memory)
-
+### Ask (LLM reasoning over memory)
 ```bash
 stixdb ask "QUESTION" -c COLLECTION --top-k 20 --depth 3
 ```
 
-Retrieves context then synthesises a grounded answer. Use when you need reasoning across multiple
-memories, not just lookup.
-
-### Ingest Files / Folders
-
+### Ingest
 ```bash
 stixdb ingest PATH -c COLLECTION --tags TAGS --chunk-size 600 --chunk-overlap 150
 ```
 
-Supported: `.py` `.js` `.ts` `.go` `.rs` `.java` `.md` `.pdf` `.txt` `.json` `.yaml` `.toml`
-`.html` `.csv` and all common code/text formats.
-
----
-
-## Coding Agent Patterns
-
-### Pattern: Starting Work on an Existing Project
-
+### Manage
 ```bash
-# You just opened a repo you've worked on before
-stixdb daemon start
-COLLECTION="proj_$(basename $(pwd))"
-
-stixdb ask "What is the current state of this project?" -c $COLLECTION
-stixdb search "in progress" -c $COLLECTION --top-k 5
-stixdb search "known bugs" -c $COLLECTION --top-k 5
-stixdb ask "What were the last 3 things we worked on?" -c $COLLECTION
-```
-
-### Pattern: Starting Work on a New Project (First Time)
-
-```bash
-COLLECTION="proj_$(basename $(pwd))"
-
-# Ingest the codebase so StixDB understands it
-stixdb ingest ./README.md -c $COLLECTION --tags overview --importance 0.9
-stixdb ingest ./ -c $COLLECTION --tags source-code --chunk-size 600
-
-# Store what you learn from reading the code
-stixdb store "Entry point is main.py — FastAPI app, starts with uvicorn" \
-  -c $COLLECTION --tags architecture --importance 0.85
-
-stixdb store "Dependencies: FastAPI, SQLAlchemy, Pydantic v2, alembic for migrations" \
-  -c $COLLECTION --tags architecture,dependencies --importance 0.85
-
-stixdb store "Tests live in tests/ — uses pytest with httpx for API tests" \
-  -c $COLLECTION --tags testing --importance 0.7
-```
-
-### Pattern: Before Answering a Coding Question
-
-```bash
-# User asks: "How should I add rate limiting to the API?"
-COLLECTION="proj_$(basename $(pwd))"
-
-# ALWAYS do this first
-stixdb search "rate limiting middleware API" -c $COLLECTION
-stixdb search "existing middleware configuration" -c $COLLECTION
-stixdb ask "What is the current middleware setup and any prior decisions about rate limiting?" \
-  -c $COLLECTION
-
-# Now answer — grounded in actual project context, not guesses
-```
-
-### Pattern: After Making a Code Change
-
-```bash
-# You just refactored or fixed something — store it immediately
-stixdb store "Refactored: split stixdb/cli.py (1200 lines) into stixdb/cli/ package — \
-  _helpers.py, _server.py, _daemon.py, _api.py — entry point is cli/__init__.py" \
-  -c proj_stixdb --tags refactor,architecture --importance 0.85
-
-stixdb store "Fixed: daemon was reading API keys from env var names instead of values — \
-  now reads cf.llm.api_key, cf.embedding.api_key directly from config.json" \
-  -c proj_stixdb --tags bugfix --importance 0.8
-```
-
-### Pattern: After Debugging a Bug
-
-```bash
-# Document the bug and its fix so future sessions don't re-investigate it
-stixdb store "BUG: numexpr cascade failure on daemon startup — root cause was wizard \
-  storing raw key as env var name, os.getenv('v1.CmMK...') returned None, fell back \
-  to sentence_transformers, triggered corrupt numexpr. FIX: store keys as plain values \
-  in config.json." \
-  -c proj_stixdb --tags bugs,solved,root-cause --importance 0.9
-```
-
-### Pattern: Recording Architecture Decisions
-
-```bash
-stixdb store "DECISION: daemon uses ~/.stixdb/config.json (global) not .stixdb/config.json \
-  (local) — rationale: daemon must be reachable from any directory and any project" \
-  -c proj_stixdb --tags decisions,architecture --importance 0.9
-
-stixdb store "DECISION: API keys stored as plain values in config.json, NOT as env var \
-  references — rationale: simpler, no env var name collision, config file is private" \
-  -c proj_stixdb --tags decisions,security --importance 0.9
-```
-
-### Pattern: Tracking TODOs and Next Steps
-
-```bash
-stixdb store "TODO: update wizard.py _preview() to show observability section fields" \
-  -c proj_stixdb --tags todo --importance 0.8
-
-# At session start, retrieve TODOs
-stixdb search "todo next steps" -c proj_stixdb --top-k 10
-```
-
-### Pattern: Tracking File Locations
-
-```bash
-stixdb store "CLI entry point: stixdb/cli/__init__.py — registers all commands and sub-apps" \
-  -c proj_stixdb --tags file-map --importance 0.8
-
-stixdb store "Config models: stixdb/config.py — ConfigFile (file schema), StixDBConfig (runtime)" \
-  -c proj_stixdb --tags file-map --importance 0.8
-
-# Retrieve when lost
-stixdb search "where is the config loading code" -c proj_stixdb
+stixdb collections list
+stixdb collections stats COLLECTION
+stixdb daemon start | stop | restart | status | logs
 ```
 
 ---
 
-## Session Memory — How to Maintain It
+## When to Store vs Search vs Ask
 
-Session memory is how you continue work across disconnected conversations. Every session that ends
-without a summary is a session that the next agent must re-investigate from scratch.
-
-### What to Store at End of Session
-
-```bash
-COLLECTION="proj_$(basename $(pwd))"
-DATE=$(date +%Y-%m-%d)
-
-# 1. What was accomplished
-stixdb store "DONE [$DATE]: Added AgentFileConfig and ObservabilityFileConfig to config.py. \
-  Wired both into _from_config_file. wizard.py now has 5 steps." \
-  -c $COLLECTION --tags session-done,$DATE --importance 0.85
-
-# 2. Where exactly work stopped
-stixdb store "STOPPED AT [$DATE]: wizard.py _preview() not yet updated to show agent \
-  and observability sections. Next: add those rows to the table." \
-  -c $COLLECTION --tags in-progress,$DATE --importance 0.95
-
-# 3. What is known to be broken or incomplete
-stixdb store "KNOWN ISSUE [$DATE]: daemon still cycling every 30s — old config.json \
-  predates the 300s default change. Fix: stixdb init --force then daemon restart." \
-  -c $COLLECTION --tags known-issues --importance 0.85
-
-# 4. What the user said that you need to remember
-stixdb store "USER PREFERENCE: user wants agent params gated behind advanced prompt, \
-  not shown by default during stixdb init" \
-  -c $COLLECTION --tags user-preferences --importance 0.9
-```
-
-### What to Load at Start of Session
-
-```bash
-COLLECTION="proj_$(basename $(pwd))"
-
-# Full project orientation — ask, don't just search
-stixdb ask "What is this project, what is its current state, and what should I work on next?" \
-  -c $COLLECTION --top-k 25 --depth 3
-
-# Specifically check for blockers and in-progress work
-stixdb search "in progress stopped at" -c $COLLECTION --top-k 5
-stixdb search "known issues todo" -c $COLLECTION --top-k 5
-stixdb search "user preferences" -c $COLLECTION --top-k 5
-```
-
-### Session Continuity Tags
-
-Use these consistently so searches are reliable:
-
-| Tag | Meaning |
-|-----|---------|
-| `in-progress` | Work started but not finished |
-| `session-done` | Completed work summary |
-| `session-summary` | Full session narrative |
-| `decisions` | Architecture or design decisions |
-| `bugfix` | Bug found and fixed |
-| `known-issues` | Known problems not yet fixed |
-| `todo` | Explicit next steps |
-| `user-preferences` | How the user wants things done |
-| `file-map` | Where things live in the codebase |
-| `architecture` | Structural / design facts |
-| `YYYY-MM-DD` | Date stamp for the session |
+| Situation | Action |
+|-----------|--------|
+| About to answer — check what is already known | `stixdb search` or `stixdb ask` first |
+| Just read a file and understand it | Store the ARCHITECTURE entry — full detail |
+| Just fixed a bug | Store the BUG FIXED entry — full root cause and fix |
+| Just made a decision | Store the DECISION entry — rationale and alternatives |
+| About to close the session | Store IN PROGRESS and SESSION SUMMARY |
+| Starting a session | `stixdb ask` for full orientation, then targeted searches |
+| User states a preference or constraint | Store immediately — `--importance 0.9` |
 
 ---
 
 ## Importance Guide
 
-| Score | Use for | What happens |
-|-------|---------|--------------|
-| `1.0` | Cannot afford to lose — critical invariants | Pinned permanently, never pruned |
-| `0.9` | User preferences, hard constraints, security decisions | Protected |
-| `0.8` | Architecture decisions, major bugs fixed | Protected |
-| `0.7` | Normal code facts, file locations, patterns | Standard retention |
-| `0.5` | Background context, minor details | May consolidate over time |
-| `0.2` | Ephemeral scratch, temporary state | Will be pruned |
+| Score | Use for |
+|-------|---------|
+| `1.0` | Hard invariants — must never be forgotten |
+| `0.9–0.95` | IN PROGRESS entries, user preferences, critical decisions |
+| `0.85` | Bug fixes, architecture docs, session summaries |
+| `0.7` | Normal facts, file locations, patterns |
+| `0.5` | Background context |
+| `0.2` | Ephemeral scratch |
 
 ---
 
-## Node Types for Coding Agents
+## Session Continuity Tags
 
-| Type | When to Use | Example |
-|------|------------|---------|
-| `fact` | Static true statements about the codebase | "Auth is in stixdb/auth/middleware.py" |
-| `concept` | Definitions, patterns, conventions used | "We use repository pattern for all DB access" |
-| `goal` | Objectives, milestones, user requests | "User wants the daemon to use 300s cycle by default" |
-| `rule` | Constraints that must always hold | "Never commit API keys to git" |
-| `pattern` | Observed recurring behaviour | "User prefers flat functions over classes for CLI commands" |
-
----
-
-## Collection Reference
-
-| Collection | What it holds |
-|-----------|--------------|
-| `proj_<repo-name>` | Everything for that coding project — **one per repo, always** |
-| `user_<name>` | Preferences and history for a specific person |
-| `knowledge_<domain>` | Reference material (docs, specs, RFCs) |
-| `agent_shared` | State shared across multiple agents working together |
-
-**Never use `main` for a coding project.** `main` is for casual one-off use only.
+| Tag | Meaning |
+|-----|---------|
+| `in-progress` | Work started but not finished |
+| `session-summary` | Full session narrative |
+| `decisions` | Architecture or design decisions |
+| `bugfix` | Bug found and fixed |
+| `known-issues` | Problems not yet fixed |
+| `todo` | Explicit next steps |
+| `user-preferences` | How the user wants things done |
+| `file-map` | Where things live in the codebase |
+| `architecture` | Structural or design facts |
+| `YYYY-MM-DD` | Date stamp |
 
 ---
 
 ## Claude Code — Exact Integration
 
-You are Claude Code. Every time you respond, do the following:
-
-**Before your first tool call:**
+**Before your first tool call in any response:**
 ```bash
 stixdb daemon start
-stixdb ask "What context do I need for this task?" -c proj_$(basename $(pwd)) --top-k 15
+stixdb ask "What context do I need for this task: [task description]?" \
+  -c proj_$(basename $(pwd)) --top-k 20 --depth 3
 ```
 
 **After your last tool call, before closing your response:**
 ```bash
-# Store what you just did
-stixdb store "DONE: [one-line summary of what was just completed]" \
-  -c proj_$(basename $(pwd)) --tags session-done,$(date +%Y-%m-%d) --importance 0.8
+COLL="proj_$(basename $(pwd))"
+DATE=$(date +%Y-%m-%d)
 
-# Store any decisions made
-stixdb store "DECISION: [what was decided and why]" \
-  -c proj_$(basename $(pwd)) --tags decisions --importance 0.85
+# Store full detail — use the templates above, never a short reference
+stixdb store "BUG FIXED / DECISION / ARCHITECTURE: [FULL CONTENT]" \
+  -c $COLL --tags TYPE,$DATE --importance 0.85
 
-# Store anything left incomplete
-stixdb store "IN PROGRESS: [what remains, what comes next]" \
-  -c proj_$(basename $(pwd)) --tags in-progress --importance 0.9
+stixdb store "IN PROGRESS [$DATE]: [FULL IN-PROGRESS TEMPLATE]" \
+  -c $COLL --tags in-progress --importance 0.95
 ```
 
 ---
 
-## Claude Desktop / ChatGPT / Other Agents
-
-If you can run shell commands, the workflow is identical. If you can only make HTTP calls, use the
-REST API directly. The daemon runs at `http://localhost:4020` by default.
+## REST API (Claude Desktop / ChatGPT / HTTP-only Agents)
 
 ```bash
 # Store
 curl -X POST http://localhost:4020/collections/proj_myapp/nodes \
   -H "Content-Type: application/json" \
-  -d '{"content": "main.py is the FastAPI entry point", "node_type": "fact", "importance": 0.8, "tags": ["architecture"]}'
+  -d '{"content": "FULL DETAILED CONTENT HERE", "node_type": "fact", "importance": 0.85, "tags": ["architecture"]}'
 
 # Search
 curl -X POST http://localhost:4020/search \
   -H "Content-Type: application/json" \
-  -d '{"query": "entry point", "collection": "proj_myapp", "top_k": 5}'
+  -d '{"query": "QUERY", "collection": "proj_myapp", "top_k": 10}'
 
 # Ask
 curl -X POST http://localhost:4020/collections/proj_myapp/ask \
   -H "Content-Type: application/json" \
-  -d '{"question": "What is the current architecture?", "top_k": 15, "depth": 2}'
+  -d '{"question": "QUESTION", "top_k": 20, "depth": 3}'
 ```
 
-Add `-H "X-API-Key: YOUR_KEY"` if you set a server API key during `stixdb init`.
+Add `-H "X-API-Key: YOUR_KEY"` if configured.
 
 ---
 
@@ -463,41 +456,30 @@ Add `-H "X-API-Key: YOUR_KEY"` if you set a server API key during `stixdb init`.
 | Symptom | Fix |
 |---------|-----|
 | `Cannot reach server` | `stixdb daemon start` |
-| `No config found` | `stixdb init` (one-time setup) |
+| `No config found` | `stixdb init` |
 | `command not found: stixdb` | `pip install stixdb-engine` |
-| Search returns nothing | Lower threshold: `--threshold 0.1`, check collection name |
-| Daemon won't start | `stixdb daemon start --fg` to see the error inline |
-| Getting wrong project's context | You are in the wrong collection — check `stixdb collections list` |
-| Slow ask response | Reduce `--top-k` to 10 and `--depth` to 1 for faster responses |
+| Search returns nothing | Lower `--threshold 0.1`, verify collection with `stixdb collections list` |
+| Getting wrong project context | Wrong collection — `stixdb collections list` and use `proj_<repo>` |
+| Daemon won't start | `stixdb daemon start --fg` to see error |
 
 ---
 
-## Quick Reference Card
+## Quick Reference
 
 ```bash
-# ── Setup (once per machine) ──────────────────────────────────────────────────
+# Setup (once)
 pip install stixdb-engine && stixdb init && stixdb daemon start
 
-# ── Every session start ───────────────────────────────────────────────────────
+# Every session start
 stixdb daemon start
-COLL="proj_$(basename $(pwd))"
-stixdb ask "Current state and where did we leave off?" -c $COLL --top-k 20
+stixdb ask "Current state and where did we leave off?" -c proj_$(basename $(pwd)) --top-k 25
 
-# ── While working ─────────────────────────────────────────────────────────────
-stixdb search "QUERY" -c $COLL --top-k 10          # recall before answering
-stixdb store "FACT" -c $COLL --importance 0.8       # store after learning
-stixdb ask "QUESTION" -c $COLL                       # reason over memory
+# While working — always full detail in store
+stixdb search "QUERY" -c proj_$(basename $(pwd)) --top-k 10
+stixdb store "BUG FIXED/DECISION/ARCHITECTURE: [FULL CONTENT]" -c proj_$(basename $(pwd)) --importance 0.85
+stixdb ask "QUESTION" -c proj_$(basename $(pwd))
 
-# ── Ingest codebase (new project) ─────────────────────────────────────────────
-stixdb ingest ./ -c $COLL --tags source-code --chunk-size 600
-
-# ── Every session end ─────────────────────────────────────────────────────────
-stixdb store "DONE: [summary]" -c $COLL --tags session-done --importance 0.85
-stixdb store "IN PROGRESS: [next steps]" -c $COLL --tags in-progress --importance 0.95
-stixdb store "DECISION: [what/why]" -c $COLL --tags decisions --importance 0.85
-
-# ── Housekeeping ──────────────────────────────────────────────────────────────
-stixdb collections list
-stixdb collections stats $COLL
-stixdb daemon logs
+# Every session end — no short references
+stixdb store "IN PROGRESS [DATE]: [full template]" -c proj_$(basename $(pwd)) --tags in-progress --importance 0.95
+stixdb store "SESSION SUMMARY [DATE]: [full template]" -c proj_$(basename $(pwd)) --tags session-summary --importance 0.85
 ```
