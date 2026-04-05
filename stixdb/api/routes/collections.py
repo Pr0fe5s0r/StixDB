@@ -219,6 +219,25 @@ async def get_stats(collection: str, request: Request):
     return await engine.get_graph_stats(collection)
 
 
+@router.post("/{collection}/dedupe")
+async def dedupe_collection(
+    collection: str,
+    request: Request,
+    dry_run: bool = False,
+):
+    """
+    Remove duplicate chunks from a collection.
+
+    Runs two passes:
+      1. Source-version dedup — removes older ingestions of the same file.
+      2. Content-hash dedup  — removes nodes with byte-identical content.
+
+    Set dry_run=true to preview what would be deleted without changing anything.
+    """
+    engine: StixDBEngine = request.app.state.engine
+    return await engine.dedupe_collection(collection, dry_run=dry_run)
+
+
 @router.delete("/{collection}")
 async def delete_collection(collection: str, request: Request):
     """Delete all data in a collection and unload it from the engine."""

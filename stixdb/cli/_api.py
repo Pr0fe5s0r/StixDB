@@ -113,6 +113,87 @@ def collections_stats(
     console.print(t)
 
 
+@collections_app.command("dedupe")
+def collections_dedupe(
+    name: str = typer.Argument(..., help="Collection name to deduplicate."),
+    host: str = typer.Option("localhost", help="Server host."),
+    port: int = typer.Option(0, help="Server port."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", "-n",
+        help="Preview duplicates without deleting anything.",
+    ),
+):
+    """
+    [bold]Remove duplicate chunks[/bold] from a collection.
+
+    Runs two passes:
+      [cyan]1.[/cyan] Source-version dedup — if the same file was ingested multiple times
+         (before the dedup fix), older versions are removed. Only the latest
+         ingestion of each source file is kept.
+      [cyan]2.[/cyan] Content-hash dedup — any two nodes with byte-identical content are
+         collapsed into one (highest importance wins).
+
+    Use [cyan]--dry-run[/cyan] to preview what would be removed without changing anything.
+
+    Examples:
+      stixdb collections dedupe proj_myapp
+      stixdb collections dedupe proj_myapp --dry-run
+    """
+    base, api_key = _conn(host, port)
+
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as prog:
+        prog.add_task(f"Scanning [bold]{name}[/bold] for duplicates…")
+        data = http_post(
+            f"{base}/collections/{name}/dedupe{'?dry_run=true' if dry_run else ''}",
+            {},
+            api_key,
+            timeout=300,
+        )
+
+    scanned   = data.get("scanned", 0)
+    src_dupes = data.get("source_version_dupes", 0)
+    ch_dupes  = data.get("content_hash_dupes", 0)
+    total     = data.get("total_duplicates", 0)
+    deleted   = data.get("deleted", 0)
+    remaining = data.get("remaining", scanned)
+
+    if total == 0:
+        console.print(
+            f"[green]✓[/green]  [bold]{name}[/bold] is clean — "
+            f"no duplicates found in {scanned} nodes."
+        )
+        return
+
+    t = Table(
+        title=f"{'[dim][DRY RUN][/dim] ' if dry_run else ''}Dedupe: {name}",
+        box=box.SIMPLE,
+        header_style="bold cyan",
+    )
+    t.add_column("Metric", style="bold")
+    t.add_column("Count", justify="right")
+    t.add_row("Nodes scanned",              str(scanned))
+    t.add_row("Source-version duplicates",  f"[yellow]{src_dupes}[/yellow]")
+    t.add_row("Content-hash duplicates",    f"[yellow]{ch_dupes}[/yellow]")
+    t.add_row("Total duplicates found",     f"[red]{total}[/red]")
+    t.add_row(
+        "Deleted" if not dry_run else "Would delete",
+        f"[{'green' if deleted or dry_run else 'dim'}]{deleted if not dry_run else total}[/]",
+    )
+    t.add_row("Remaining after clean",      str(remaining if not dry_run else scanned - total))
+    console.print(t)
+
+    if dry_run:
+        console.print(
+            f"\n[dim]Dry run — nothing deleted.  "
+            f"Run without [bold]--dry-run[/bold] to remove {total} duplicate(s).[/dim]"
+        )
+    else:
+        console.print(
+            f"\n[green]✓[/green]  Removed [bold red]{deleted}[/bold red] duplicate(s) "
+            f"from [cyan]{name}[/cyan].  {remaining} nodes remain."
+        )
+
+
 # ── ingest ─────────────────────────────────────────────────────────────────────
 
 def cmd_ingest(

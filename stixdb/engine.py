@@ -1265,6 +1265,95 @@ class StixDBEngine:
         """Alias for get_graph_stats for ergonomic API."""
         return await self.get_graph_stats(collection)
 
+    async def dedupe_collection(self, collection: str, dry_run: bool = False) -> dict:
+        """
+        Remove duplicate chunks from a collection.
+
+        Two-pass strategy:
+          1. Source-version dedup — if the same source file was ingested multiple
+             times (different document_hash = different file versions), keep only
+             the most recent ingestion and discard all older versions.
+          2. Content-hash dedup — within the surviving set, if two nodes have
+             identical content_hash (byte-for-byte same text), keep the one with
+             higher importance (or the older node on a tie) and delete the rest.
+
+        Returns a summary dict. When dry_run=True no nodes are deleted.
+        """
+        self._assert_started()
+        graph, _, _ = await self._ensure_collection(collection)
+        nodes = await graph.list_nodes(limit=200_000)
+
+        to_delete: set[str] = set()
+
+        # ── Pass 1: source-version dedup ─────────────────────────────────────
+        # Group by source → document_hash → [nodes]
+        by_source: dict[str, dict[str, list]] = {}
+        for node in nodes:
+            src = node.source
+            doc_hash = (node.metadata or {}).get("document_hash")
+            if not src or not doc_hash:
+                continue
+            by_source.setdefault(src, {}).setdefault(doc_hash, []).append(node)
+
+        source_dupes = 0
+        for src, versions in by_source.items():
+            if len(versions) <= 1:
+                continue
+            # Sort versions by their latest ingested_at; keep the newest
+            sorted_versions = sorted(
+                versions.items(),
+                key=lambda kv: max(
+                    (n.metadata or {}).get("ingested_at", 0.0) for n in kv[1]
+                ),
+                reverse=True,
+            )
+            for _, stale_nodes in sorted_versions[1:]:
+                for n in stale_nodes:
+                    to_delete.add(n.id)
+                    source_dupes += 1
+
+        # ── Pass 2: content-hash dedup ────────────────────────────────────────
+        # Among nodes not already marked for deletion, deduplicate identical text
+        seen_content: dict[str, object] = {}  # content_hash → winning node
+        content_dupes = 0
+        for node in nodes:
+            if node.id in to_delete:
+                continue
+            ch = (node.metadata or {}).get("content_hash") or self._hash_text(node.content or "")
+            if not ch:
+                continue
+            if ch in seen_content:
+                existing = seen_content[ch]
+                # Keep higher importance; on tie keep the older node (lower created_at)
+                if node.importance > existing.importance or (
+                    node.importance == existing.importance
+                    and node.created_at < existing.created_at
+                ):
+                    to_delete.add(existing.id)
+                    seen_content[ch] = node
+                else:
+                    to_delete.add(node.id)
+                content_dupes += 1
+            else:
+                seen_content[ch] = node
+
+        deleted = 0
+        if not dry_run:
+            for node_id in to_delete:
+                await graph.delete_node(node_id)
+                deleted += 1
+
+        return {
+            "collection": collection,
+            "scanned": len(nodes),
+            "source_version_dupes": source_dupes,
+            "content_hash_dupes": content_dupes,
+            "total_duplicates": len(to_delete),
+            "deleted": deleted,
+            "remaining": len(nodes) - deleted,
+            "dry_run": dry_run,
+        }
+
     def get_traces(
         self,
         collection: Optional[str] = None,
