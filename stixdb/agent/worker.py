@@ -149,12 +149,19 @@ class MemoryAgentWorker:
 
     async def _run_cycle(self) -> None:
         """One complete perceive → plan → act cycle."""
+        # Skip the cycle entirely if the collection is empty — no work to do.
+        node_count = await self.graph.count_nodes()
+        if node_count == 0:
+            logger.debug(
+                "Agent cycle skipped — collection is empty",
+                collection=self.graph.collection,
+            )
+            return
+
         cycle_start = time.time()
         collection = self.graph.collection
 
         logger.debug("Agent cycle starting", collection=collection, cycle=self._status.cycle_count)
-
-        # ── PERCEIVE ────────────────────────────────────────────────────
         # (Access pattern data is collected reactively via record_access()
         #  calls from the Context Broker — nothing to do here explicitly.)
 

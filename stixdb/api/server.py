@@ -3,7 +3,7 @@ StixDB FastAPI REST Server.
 
 Exposes the full StixDBEngine over HTTP.
 Run with:
-    uvicorn stix.api.server:app --host 0.0.0.0 --port 8080 --reload
+    uvicorn stixdb.api.server:app --host 0.0.0.0 --port 8080 --reload
     
 Or via CLI:
     stixdb serve
@@ -31,9 +31,15 @@ engine: StixDBEngine = None  # type: ignore
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage engine lifecycle with the FastAPI lifespan protocol."""
+    """Manage engine lifecycle with the FastAPI lifespan protocol.
+
+    Config resolution order:
+      1. STIXDB_PROJECT_DIR/.stixdb/config.json   (set by `stixdb serve`)
+      2. .stixdb/config.json in cwd
+      3. Environment variables / defaults
+    """
     global engine
-    config = StixDBConfig.from_env()
+    config = StixDBConfig.load()   # smart loader: file → env → defaults
     engine = StixDBEngine(config=config)
     await engine.start()
     app.state.engine = engine

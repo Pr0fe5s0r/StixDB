@@ -134,6 +134,151 @@ class IngestionConfig(BaseModel):
     default_chunk_overlap: int = 200
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ConfigFile — file-based configuration (.stixdb/config.json)
+# Safe to commit to git: stores env var NAME references, never raw secrets.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Named provider presets (friendly names → internal enum + base_url)
+NAMED_LLM_PRESETS: dict[str, dict] = {
+    "nebius":     {"base_url": "https://api.studio.nebius.ai/v1/"},
+    "openrouter": {"base_url": "https://openrouter.ai/api/v1"},
+}
+NAMED_EMBEDDING_PRESETS: dict[str, dict] = {
+    "nebius":     {"base_url": "https://api.studio.nebius.ai/v1/"},
+    "openrouter": {"base_url": "https://openrouter.ai/api/v1"},
+}
+
+# Model suggestions shown to users in the wizard
+LLM_MODEL_SUGGESTIONS: dict[str, list[str]] = {
+    "openai":      ["gpt-4o", "gpt-4o-mini", "o3-mini"],
+    "anthropic":   ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
+    "nebius":      ["openai/gpt-oss-120b", "meta-llama/Meta-Llama-3.1-70B-Instruct-fast"],
+    "openrouter":  ["openai/gpt-4o", "anthropic/claude-3.5-sonnet", "google/gemini-pro"],
+    "ollama":      ["llama3.2", "mistral", "qwen2.5"],
+    "custom":      [],
+    "none":        [],
+}
+EMBEDDING_MODEL_SUGGESTIONS: dict[str, list[str]] = {
+    "local":       ["all-MiniLM-L6-v2", "all-mpnet-base-v2", "BAAI/bge-small-en-v1.5"],
+    "openai":      ["text-embedding-3-small", "text-embedding-3-large"],
+    "nebius":      ["Qwen/Qwen3-Embedding-8B", "BAAI/bge-m3"],
+    "openrouter":  ["text-embedding-3-small"],
+    "ollama":      ["nomic-embed-text", "mxbai-embed-large"],
+    "custom":      [],
+}
+KNOWN_EMBEDDING_DIMENSIONS: dict[str, int] = {
+    "all-MiniLM-L6-v2":         384,
+    "all-mpnet-base-v2":         768,
+    "BAAI/bge-small-en-v1.5":   384,
+    "BAAI/bge-m3":               1024,
+    "text-embedding-3-small":    1536,
+    "text-embedding-3-large":    3072,
+    "Qwen/Qwen3-Embedding-8B":   4096,
+    "nomic-embed-text":          768,
+    "mxbai-embed-large":         1024,
+}
+
+
+class LLMFileConfig(BaseModel):
+    """LLM provider + reasoning parameters stored in config.json."""
+    provider: str                       # "openai"|"anthropic"|"nebius"|"openrouter"|"ollama"|"custom"|"none"
+    model: str
+    api_key: Optional[str] = None      # raw key value — stored directly in config.json
+    base_url: Optional[str] = None     # auto-set for nebius/openrouter; required for custom
+    # Reasoning / inference parameters
+    temperature: float = 0.2
+    max_tokens: int = 2048
+    max_context_nodes: int = 20        # graph nodes passed as context to the LLM
+    graph_traversal_depth: int = 3     # BFS depth for subgraph expansion
+    timeout: float = 60.0              # API call timeout in seconds
+
+
+class EmbeddingFileConfig(BaseModel):
+    """Embedding provider config stored in config.json."""
+    provider: str                       # "local"|"openai"|"nebius"|"openrouter"|"ollama"|"custom"
+    model: str
+    dimensions: int = 384
+    api_key: Optional[str] = None      # raw key value
+    base_url: Optional[str] = None
+
+
+class StorageFileConfig(BaseModel):
+    """Storage config stored in config.json."""
+    mode: str = "kuzu"                  # "kuzu"|"memory"|"neo4j"
+    path: str = "./stixdb_data"
+    neo4j_uri: Optional[str] = None
+    neo4j_user_env: Optional[str] = None
+    neo4j_password_env: Optional[str] = None
+
+
+class IngestionFileConfig(BaseModel):
+    """Ingestion / chunking config stored in config.json."""
+    chunk_size: int = 1000
+    chunk_overlap: int = 200
+    strategy: str = "fixed"
+    # "fixed"     — fixed-size character windows (fastest)
+    # "paragraph" — split on double-newlines
+    # "sentence"  — sentence boundaries (requires nltk)
+    # "semantic"  — embedding-based chunking (slowest, best quality)
+    # "page"      — one chunk per PDF page
+
+
+class AgentFileConfig(BaseModel):
+    """Autonomous memory-agent parameters stored in config.json."""
+    cycle_interval: float = 300.0          # seconds between perceive/plan/act loops
+    consolidation_threshold: float = 0.88  # cosine similarity above which nodes are merged
+    decay_half_life_hours: float = 48.0    # hours for importance to halve when unaccessed
+    prune_threshold: float = 0.05          # nodes below this importance are pruned
+    working_memory_max: int = 256          # max hot nodes in working memory
+    max_consolidation_batch: int = 64      # nodes processed per consolidation cycle
+    auto_summarize: bool = True            # auto-summarise large node clusters
+    lineage_safe_mode: bool = True         # protect source nodes from post-summary pruning
+
+
+class ObservabilityFileConfig(BaseModel):
+    """Tracing, metrics, and logging config stored in config.json."""
+    enable_traces: bool = True
+    enable_metrics: bool = True
+    metrics_port: int = 9090
+    log_level: str = "INFO"               # DEBUG | INFO | WARNING | ERROR
+
+
+class ServerFileConfig(BaseModel):
+    """HTTP server config stored in config.json."""
+    port: int = 4020
+    api_key: Optional[str] = None         # raw server auth key; None = no auth
+
+
+class ConfigFile(BaseModel):
+    """
+    Complete StixDB configuration stored in config.json.
+
+    API keys are stored as plain values — keep this file private.
+    """
+    llm: LLMFileConfig
+    embedding: EmbeddingFileConfig
+    storage: StorageFileConfig = Field(default_factory=StorageFileConfig)
+    ingestion: IngestionFileConfig = Field(default_factory=IngestionFileConfig)
+    agent: AgentFileConfig = Field(default_factory=AgentFileConfig)
+    observability: ObservabilityFileConfig = Field(default_factory=ObservabilityFileConfig)
+    server: ServerFileConfig = Field(default_factory=ServerFileConfig)
+    default_collection: str = "main"
+
+    def save(self, path: "Path") -> None:
+        """Write config to disk as pretty-printed JSON."""
+        from pathlib import Path as _Path
+        p = _Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(self.model_dump_json(indent=2, exclude_none=True), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: "Path") -> "ConfigFile":
+        """Load and validate config from a JSON file."""
+        from pathlib import Path as _Path
+        return cls.model_validate_json(_Path(path).read_text(encoding="utf-8"))
+
+
 class StixDBConfig(BaseModel):
     """
     Master configuration for a StixDBEngine instance.
@@ -160,6 +305,157 @@ class StixDBConfig(BaseModel):
     log_level: str = "INFO"
 
     @classmethod
+    def from_file(cls, path: "Path") -> "StixDBConfig":
+        """Load config from a .stixdb/config.json file, resolving env var references at runtime."""
+        from pathlib import Path as _Path
+        cf = ConfigFile.load(_Path(path))
+        return cls._from_config_file(cf)
+
+    @classmethod
+    def load(cls, project_dir: "Optional[Path]" = None) -> "StixDBConfig":
+        """
+        Smart loader: tries .stixdb/config.json → env vars → defaults.
+
+        Resolution order:
+          1. ``project_dir`` argument (if given)
+          2. ``STIXDB_PROJECT_DIR`` environment variable (set by ``stixdb serve``)
+          3. Current working directory
+          4. Environment variables / defaults
+
+        Use this instead of from_env() when running in a project with stixdb init.
+        """
+        from pathlib import Path as _Path
+        if project_dir:
+            base = _Path(project_dir)
+        elif os.getenv("STIXDB_PROJECT_DIR"):
+            base = _Path(os.environ["STIXDB_PROJECT_DIR"])
+        else:
+            base = _Path.cwd()
+
+        config_path = base / ".stixdb" / "config.json"
+        if config_path.exists():
+            return cls.from_file(config_path)
+        return cls.from_env()
+
+    @classmethod
+    def _from_config_file(cls, cf: "ConfigFile") -> "StixDBConfig":
+        """Translate a ConfigFile object into a full StixDBConfig, resolving env var refs."""
+        # Start from env baseline so agent tuning / backup / observability env vars still work
+        base = cls.from_env()
+
+        # ── LLM ──────────────────────────────────────────────────────────────
+        llm_provider_map = {
+            "openai":      LLMProvider.OPENAI,
+            "anthropic":   LLMProvider.ANTHROPIC,
+            "ollama":      LLMProvider.OLLAMA,
+            "custom":      LLMProvider.CUSTOM,
+            "none":        LLMProvider.NONE,
+            # Named presets map to CUSTOM internally
+            "nebius":      LLMProvider.CUSTOM,
+            "openrouter":  LLMProvider.CUSTOM,
+        }
+        llm_provider = llm_provider_map.get(cf.llm.provider, LLMProvider.CUSTOM)
+
+        # Resolve base_url: explicit > preset > None
+        llm_base_url = cf.llm.base_url or NAMED_LLM_PRESETS.get(cf.llm.provider, {}).get("base_url")
+
+        # Read api key directly from config.json
+        llm_api_key = cf.llm.api_key or None
+
+        base.reasoner = ReasonerConfig(
+            provider=llm_provider,
+            model=cf.llm.model,
+            temperature=cf.llm.temperature,
+            max_tokens=cf.llm.max_tokens,
+            max_context_nodes=cf.llm.max_context_nodes,
+            graph_traversal_depth=cf.llm.graph_traversal_depth,
+            timeout_seconds=cf.llm.timeout,
+            openai_api_key=llm_api_key if cf.llm.provider == "openai" else base.reasoner.openai_api_key,
+            anthropic_api_key=llm_api_key if cf.llm.provider == "anthropic" else base.reasoner.anthropic_api_key,
+            ollama_base_url=llm_base_url or base.reasoner.ollama_base_url,
+            custom_base_url=llm_base_url if llm_provider == LLMProvider.CUSTOM else base.reasoner.custom_base_url,
+            custom_api_key=llm_api_key if llm_provider == LLMProvider.CUSTOM else base.reasoner.custom_api_key,
+        )
+
+        # ── Embedding ─────────────────────────────────────────────────────────
+        emb_provider_map = {
+            "local":       EmbeddingProvider.SENTENCE_TRANSFORMERS,
+            "openai":      EmbeddingProvider.OPENAI,
+            "ollama":      EmbeddingProvider.OLLAMA,
+            "custom":      EmbeddingProvider.CUSTOM,
+            "nebius":      EmbeddingProvider.CUSTOM,
+            "openrouter":  EmbeddingProvider.CUSTOM,
+        }
+        emb_provider = emb_provider_map.get(cf.embedding.provider, EmbeddingProvider.CUSTOM)
+        emb_base_url = cf.embedding.base_url or NAMED_EMBEDDING_PRESETS.get(cf.embedding.provider, {}).get("base_url")
+        emb_api_key = cf.embedding.api_key or None
+
+        base.embedding = EmbeddingConfig(
+            provider=emb_provider,
+            model=cf.embedding.model,
+            dimensions=cf.embedding.dimensions,
+            openai_api_key=emb_api_key if cf.embedding.provider == "openai" else base.embedding.openai_api_key,
+            ollama_base_url=emb_base_url or base.embedding.ollama_base_url,
+            custom_base_url=emb_base_url if emb_provider == EmbeddingProvider.CUSTOM else base.embedding.custom_base_url,
+            custom_api_key=emb_api_key if emb_provider == EmbeddingProvider.CUSTOM else base.embedding.custom_api_key,
+        )
+
+        # ── Storage ───────────────────────────────────────────────────────────
+        storage_mode_map = {
+            "kuzu":   StorageMode.KUZU,
+            "memory": StorageMode.MEMORY,
+            "neo4j":  StorageMode.NEO4J,
+        }
+        storage_mode = storage_mode_map.get(cf.storage.mode, StorageMode.KUZU)
+        data_dir = cf.storage.path
+
+        base.storage = StorageConfig(
+            mode=storage_mode,
+            data_dir=data_dir,
+            vector_backend=base.storage.vector_backend,
+            kuzu_path=os.path.join(data_dir, "kuzu"),
+            neo4j_uri=cf.storage.neo4j_uri or base.storage.neo4j_uri,
+            neo4j_user=os.getenv(cf.storage.neo4j_user_env, "neo4j") if cf.storage.neo4j_user_env else base.storage.neo4j_user,
+            neo4j_password=os.getenv(cf.storage.neo4j_password_env, "password") if cf.storage.neo4j_password_env else base.storage.neo4j_password,
+            qdrant_host=base.storage.qdrant_host,
+            qdrant_port=base.storage.qdrant_port,
+            sql_url=base.storage.sql_url,
+            max_active_nodes=base.storage.max_active_nodes,
+        )
+
+        # ── Ingestion ─────────────────────────────────────────────────────────
+        base.ingestion = IngestionConfig(
+            default_chunk_size=cf.ingestion.chunk_size,
+            default_chunk_overlap=cf.ingestion.chunk_overlap,
+        )
+
+        # ── Agent ─────────────────────────────────────────────────────────────
+        base.agent = AgentConfig(
+            cycle_interval_seconds=cf.agent.cycle_interval,
+            consolidation_similarity_threshold=cf.agent.consolidation_threshold,
+            decay_half_life_hours=cf.agent.decay_half_life_hours,
+            prune_importance_threshold=cf.agent.prune_threshold,
+            working_memory_max_nodes=cf.agent.working_memory_max,
+            max_consolidation_batch=cf.agent.max_consolidation_batch,
+            enable_auto_summarize=cf.agent.auto_summarize,
+            lineage_safe_mode=cf.agent.lineage_safe_mode,
+        )
+
+        # ── Observability ─────────────────────────────────────────────────────
+        base.enable_traces = cf.observability.enable_traces
+        base.enable_metrics = cf.observability.enable_metrics
+        base.metrics_port = cf.observability.metrics_port
+        base.log_level = cf.observability.log_level
+
+        # ── API server ────────────────────────────────────────────────────────
+        base.api = ApiServerConfig(
+            port=cf.server.port,
+            api_key=cf.server.api_key or None,
+        )
+
+        return base
+
+    @classmethod
     def from_env(cls) -> "StixDBConfig":
         """Build config from environment variables with sane defaults."""
         try:
@@ -182,7 +478,7 @@ class StixDBConfig(BaseModel):
 
         return cls(
             agent=AgentConfig(
-                cycle_interval_seconds=float(_e("STIXDB_AGENT_CYCLE_INTERVAL", "30.0")),
+                cycle_interval_seconds=float(_e("STIXDB_AGENT_CYCLE_INTERVAL", "300.0")),
                 consolidation_similarity_threshold=float(_e("STIXDB_AGENT_CONSOLIDATION_THRESHOLD", "0.88")),
                 decay_half_life_hours=float(_e("STIXDB_AGENT_DECAY_HALF_LIFE", "48.0")),
                 prune_importance_threshold=float(_e("STIXDB_AGENT_PRUNE_THRESHOLD", "0.05")),
