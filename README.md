@@ -130,6 +130,22 @@ The cycle runs in the background on an async loop and **does not block your quer
 
 ---
 
+## The Evolving Knowledge Graph
+
+Unlike traditional vector databases that store a "flat" list of disconnected chunks, StixDB builds a living, interconnected network of knowledge. As the background agent works, it transforms raw data into a structured graph that evolves over time.
+
+<p align="center">
+  <img src="assets/example_graph_evoled.png" alt="Example of an Evolved StixDB Graph" width="800" />
+</p>
+
+### From Flat to "Evolved"
+1.  **Raw Input**: When you first ingest data, it starts as "working" or "episodic" nodes (the green and orange dots). At this stage, they are mostly disconnected.
+2.  **Autonomous Organization**: Over several background cycles, the agent identifies semantic similarities and creates links (the teal lines). It moves nodes from "working" to "semantic" tiers.
+3.  **Synthesis**: Multiple related nodes are merged into **Summary nodes** (the diamond shapes), distilling high-level knowledge while preserving the lineage of original details (archived nodes).
+4.  **Temporal Growth**: Your agent's memory isn't just a pile of documents; it's a map of connected concepts, procedures, and experiences that "breathes" as new information arrives and stale data fades away through exponential decay.
+
+---
+
 ## Scale Expectations (Honest Numbers)
 
 StixDB uses an in-process NumPy cosine search by default. Here's what to expect:

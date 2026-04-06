@@ -36,6 +36,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional, AsyncIterator
 
+import numpy as np
+
 import structlog
 
 from stixdb.config import StixDBConfig, StorageMode, VectorBackend, LLMProvider  # noqa: F401
@@ -453,7 +455,92 @@ class StixDBEngine:
         if not items:
             return []
 
-        return await self.bulk_store(collection=collection, items=items)
+        nodes = await graph.bulk_add_nodes(items)
+        await self._sync_chunks_with_summaries(graph, nodes)
+        return [n.id for n in nodes]
+
+    async def _sync_chunks_with_summaries(
+        self,
+        graph: MemoryGraph,
+        new_nodes: list,
+    ) -> None:
+        """
+        After ingestion, link each new chunk to the most semantically similar
+        existing SUMMARY node (if any). When a match is found:
+          - A DERIVED_FROM edge is added (summary → chunk) so the summary
+            is aware of this new piece of evidence.
+          - The summary's embedding is updated to the normalised centroid of
+            its old embedding and the chunk's embedding.
+          - The chunk's node ID is appended to the summary's source lineage.
+
+        This keeps summaries coherent as new content arrives and prevents the
+        consolidation cycle from creating duplicate summaries for content that
+        is already represented.
+        """
+        threshold = self.config.agent.consolidation_similarity_threshold
+
+        summary_nodes = await graph.list_nodes(node_type="summary", limit=5000)
+        summaries_with_emb = [
+            (s, np.array(s.embedding, dtype=np.float32))
+            for s in summary_nodes
+            if s.embedding is not None
+        ]
+        if not summaries_with_emb:
+            return
+
+        for chunk_node in new_nodes:
+            if chunk_node.embedding is None:
+                continue
+            chunk_emb = np.array(chunk_node.embedding, dtype=np.float32)
+
+            # Find the single most similar summary above threshold
+            best_sim = -1.0
+            best_summary = None
+            best_summary_emb = None
+            for summary, summary_emb in summaries_with_emb:
+                sim = float(np.clip(np.dot(chunk_emb, summary_emb), -1.0, 1.0))
+                if sim >= threshold and sim > best_sim:
+                    best_sim = sim
+                    best_summary = summary
+                    best_summary_emb = summary_emb
+
+            if best_summary is None:
+                continue
+
+            # Link the chunk as a new evidence source for this summary
+            await graph.add_edge(
+                source_id=best_summary.id,
+                target_id=chunk_node.id,
+                relation_type=RelationType.DERIVED_FROM,
+                weight=best_sim,
+                created_by="ingest-sync",
+                metadata={"sync_similarity": best_sim, "sync_type": "chunk_summary_sync"},
+            )
+
+            # Update the summary's embedding centroid to include this chunk
+            new_emb = (best_summary_emb + chunk_emb) / 2.0
+            norm = np.linalg.norm(new_emb)
+            if norm > 0:
+                new_emb = new_emb / norm
+            best_summary.set_embedding(new_emb)
+
+            lineage = best_summary.metadata.get("source_lineage", [])
+            lineage.append({
+                "node_id": chunk_node.id,
+                "source": chunk_node.source,
+                "synced_at": time.time(),
+                "sync_similarity": best_sim,
+            })
+            best_summary.metadata["source_lineage"] = lineage
+            await graph.update_node(best_summary)
+
+            logger.info(
+                "Synced ingested chunk with existing summary",
+                summary_id=best_summary.id[:8],
+                chunk_id=chunk_node.id[:8],
+                similarity=f"{best_sim:.3f}",
+                collection=graph.collection,
+            )
 
     async def ingest_folder(
         self,
@@ -550,19 +637,32 @@ class StixDBEngine:
         depth: int = 2,
         system_prompt: Optional[str] = None,
         output_schema: Optional[dict] = None,
+        thinking_steps: int = 1,
+        hops_per_step: int = 4,
+        max_tokens: Optional[int] = None,
     ) -> ContextResponse:
         """
         Ask the StixDB agent a natural-language question.
-        
-        Returns a ContextResponse with:
-        - answer: The synthesised answer
-        - reasoning_trace: Step-by-step agent reasoning
-        - sources: The memory nodes used
-        - confidence: How confident the agent is (0-1)
-        
-        This is the primary API for external agents.
+
+        When thinking_steps > 1, the engine runs the multi-hop reasoning loop
+        (recursive_chat) which issues multiple retrieval hops per step, refines
+        its search query based on what it finds, and checks confidence before
+        stopping.  This produces richer answers for complex questions at the
+        cost of more LLM calls.
+
+        Args:
+            thinking_steps: Number of reasoning steps (1 = single-pass, ≥2 = multi-hop).
+            hops_per_step:  Max retrieval hops within each thinking step.
         """
         self._assert_started()
+        if thinking_steps > 1:
+            return await self.recursive_chat(
+                collection=collection,
+                question=question,
+                thinking_steps=thinking_steps,
+                hops_per_step=hops_per_step,
+                threshold=max(threshold, 0.25),
+            )
         _, _, broker = await self._ensure_collection(collection)
         return await broker.ask(
             question=question,
@@ -571,6 +671,7 @@ class StixDBEngine:
             graph_depth=depth,
             system_prompt=system_prompt,
             output_schema=output_schema,
+            max_tokens=max_tokens,
             query_origin="user",
         )
 
@@ -1096,8 +1197,11 @@ class StixDBEngine:
             question=question,
             answer=last_reasoning.answer,
             reasoning_trace=(
+                f"--- Thinking Status ---\n"
                 f"Dynamic thinking completed in {len(step_summaries)} step(s) "
-                f"across {total_hops} hop(s). Confidence was checked after each step."
+                f"across {total_hops} hop(s). Confidence was checked after each step.\n\n"
+                f"--- Final Chain of Thought ---\n"
+                f"{last_reasoning.reasoning_trace}"
             ),
             sources=[SourceNode.from_node(n, 1.0) for n in accumulated_nodes[:broker.reasoner.config.max_context_nodes]],
             total_nodes_searched=len({n.id for n in accumulated_nodes}),

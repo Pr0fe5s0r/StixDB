@@ -53,6 +53,7 @@ from stixdb.cli._api import (
     cmd_store,
     cmd_search,
     cmd_ask,
+    cmd_graph,
 )
 from stixdb.cli._server import (
     cmd_init,
@@ -97,6 +98,7 @@ app.command("ingest")(cmd_ingest)
 app.command("store")(cmd_store)
 app.command("search")(cmd_search)
 app.command("ask")(cmd_ask)
+app.command("graph")(cmd_graph)
 
 
 if __name__ == "__main__":

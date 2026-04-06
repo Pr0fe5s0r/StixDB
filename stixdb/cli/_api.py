@@ -678,6 +678,9 @@ def cmd_ask(
     port: int = typer.Option(0, help="Server port."),
     top_k: int = typer.Option(15, "--top-k", "-k", help="Context nodes to retrieve."),
     depth: int = typer.Option(2, help="Graph traversal depth."),
+    thinking: int = typer.Option(1, "--thinking", "-t", help="Thinking steps (>1 enables multi-hop reasoning)."),
+    hops: int = typer.Option(4, "--hops", help="Max retrieval hops per thinking step."),
+    max_tokens: Optional[int] = typer.Option(None, "--max-tokens", "-m", help="Max tokens for the LLM response. Overrides server default."),
     json_output: bool = typer.Option(False, "--json", help="Output raw JSON."),
 ):
     """
@@ -686,9 +689,14 @@ def cmd_ask(
     Retrieves relevant context from the memory graph and synthesises a
     grounded, cited answer using the configured LLM.
 
+    [bold cyan]Thinking Mode:[/bold cyan]
+    Use [cyan]--thinking 2[/cyan] or higher to enable autonomous multi-hop reasoning.
+    The agent will perform multiple retrieval rounds, refine its internal
+    query based on what it finds, and synthesize a deep answer.
+
     Examples:
       stixdb ask "What payment processor do we use?"
-      stixdb ask "Summarise our security posture" -c infra --depth 3
+      stixdb ask "Summarise our security posture" -c infra --thinking 3
       stixdb ask "Who owns the auth service?" --json
     """
     base, api_key = _conn(host, port)
@@ -699,10 +707,14 @@ def cmd_ask(
         "top_k": top_k,
         "depth": depth,
         "threshold": 0.2,
+        "thinking_steps": thinking,
+        "hops_per_step": hops,
     }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
 
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as prog:
-        prog.add_task("Thinking…")
+        prog.add_task("Thinking…" if thinking > 1 else "Synthesising…")
         data = http_post(f"{base}/collections/{coll}/ask", payload, api_key)
 
     if json_output:
@@ -711,7 +723,7 @@ def cmd_ask(
 
     answer    = data.get("answer") or data.get("response") or data.get("content", "")
     sources   = data.get("sources") or data.get("citations") or []
-    reasoning = data.get("reasoning") or ""
+    reasoning = data.get("reasoning_trace") or data.get("reasoning") or ""
 
     console.print()
     console.print(Panel(
@@ -736,19 +748,309 @@ def cmd_ask(
         t.add_column("Snippet")
         for i, src in enumerate(sources[:8], 1):
             if isinstance(src, dict):
-                node_id = src.get("id", src.get("node_id", ""))
-                snippet = str(src.get("content", src.get("snippet", "")))[:120]
+                node_id = src.get("node_id") or src.get("id") or ""
+                snippet = str(src.get("content") or src.get("snippet", ""))[:120]
             else:
                 node_id, snippet = "", str(src)[:120]
             t.add_row(str(i), node_id, snippet)
         console.print(t)
 
     if reasoning:
+        # Increase the truncation for a better "thinking" preview
+        limit = 2000
+        preview = reasoning[:limit] + ("…" if len(reasoning) > limit else "")
         console.print(Panel(
-            f"[dim]{reasoning[:600]}{'…' if len(reasoning) > 600 else ''}[/dim]",
-            title="[dim]Reasoning[/dim]",
+            f"[dim]{preview}[/dim]",
+            title="[dim]Thinking[/dim]",
             border_style="dim",
             padding=(0, 2),
         ))
 
     console.print()
+
+
+# ── Graph viewer ───────────────────────────────────────────────────────────────
+
+_GRAPH_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>StixDB Graph &mdash; __COLLECTION__</title>
+<script src="/vis-network.js"></script>
+<link rel="stylesheet" href="/vis-network.css"/>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0d1117; color: #c9d1d9; font-family: ui-monospace, "Cascadia Code", monospace; }
+  #graph { position: fixed; inset: 0; }
+
+  /* ── side panel ── */
+  #panel {
+    position: fixed; top: 12px; right: 12px;
+    width: 340px; max-height: calc(100vh - 24px);
+    background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+    padding: 16px; overflow-y: auto; z-index: 10;
+  }
+  #panel h2 { font-size: 13px; color: #58a6ff; margin-bottom: 10px; }
+  #panel .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 12px;
+    font-size: 10px; font-weight: 600; margin: 2px 2px 8px 0;
+    background: #21262d; border: 1px solid #30363d;
+  }
+  #panel pre {
+    font-size: 11px; white-space: pre-wrap; word-break: break-word;
+    color: #8b949e; line-height: 1.5; margin-top: 8px;
+    border-top: 1px solid #21262d; padding-top: 8px;
+  }
+  #panel .meta { font-size: 11px; color: #6e7681; margin: 2px 0; }
+
+  /* ── legend ── */
+  #legend {
+    position: fixed; bottom: 12px; left: 12px;
+    background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+    padding: 12px 16px; z-index: 10; font-size: 11px; line-height: 1.9;
+  }
+  #legend b { color: #8b949e; display: block; margin-top: 6px; }
+  #legend b:first-child { margin-top: 0; }
+  .dot { display: inline-block; width: 11px; height: 11px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  .diamond { display: inline-block; width: 11px; height: 11px; background: currentColor;
+             transform: rotate(45deg); margin-right: 6px; vertical-align: middle; }
+
+  /* ── header strip ── */
+  #header {
+    position: fixed; top: 12px; left: 12px;
+    background: #161b22cc; border: 1px solid #30363d; border-radius: 8px;
+    padding: 6px 14px; font-size: 12px; color: #8b949e; z-index: 10;
+    backdrop-filter: blur(4px);
+  }
+  #header span { color: #58a6ff; font-weight: 600; }
+</style>
+</head>
+<body>
+<div id="graph"></div>
+<div id="header">StixDB &mdash; <span>__COLLECTION__</span></div>
+<div id="panel"><h2>Graph Explorer</h2><p style="font-size:11px;color:#6e7681">Click any node to inspect it.</p></div>
+<div id="legend">
+  <b>Tier (colour)</b>
+  <div><span class="dot" style="background:#f97316"></span>working</div>
+  <div><span class="dot" style="background:#3b82f6"></span>semantic</div>
+  <div><span class="dot" style="background:#22c55e"></span>episodic</div>
+  <div><span class="dot" style="background:#a855f7"></span>procedural</div>
+  <div><span class="dot" style="background:#6b7280"></span>archived</div>
+  <b>Type (shape)</b>
+  <div><span class="dot" style="background:#c9d1d9"></span>fact</div>
+  <div><span class="diamond" style="color:#c9d1d9"></span>summary</div>
+</div>
+
+<script>
+(function () {
+  const TIER_COLORS = {
+    working:    "#f97316",
+    semantic:   "#3b82f6",
+    episodic:   "#22c55e",
+    procedural: "#a855f7",
+    archived:   "#6b7280",
+  };
+  const EDGE_COLORS = {
+    derived_from: "#60a5fa",
+    summarizes:   "#34d399",
+    relates_to:   "#6b7280",
+    causes:       "#f87171",
+    supports:     "#a3e635",
+    contradicts:  "#f97316",
+  };
+
+  const raw = __GRAPH_DATA__;
+
+  const visNodes = raw.nodes.map(n => ({
+    id: n.id,
+    label: (n.content || "").slice(0, 36) + ((n.content || "").length > 36 ? "\u2026" : ""),
+    color: {
+      background: TIER_COLORS[n.tier] || "#6b7280",
+      border:     TIER_COLORS[n.tier] || "#6b7280",
+      highlight:  { background: "#f0f6fc", border: "#58a6ff" },
+      hover:      { background: "#f0f6fc", border: "#58a6ff" },
+    },
+    shape: (n.node_type === "summary") ? "diamond" : "dot",
+    size: 8 + Math.round((n.importance || 0.5) * 18),
+    font: { color: "#c9d1d9", size: 11, face: "monospace" },
+    borderWidth: n.pinned ? 3 : 1,
+    borderWidthSelected: 3,
+    _raw: n,
+  }));
+
+  const visEdges = raw.edges.map(e => ({
+    id: e.id,
+    from: e.source_id,
+    to:   e.target_id,
+    label: (e.relation_type || "").replace(/_/g, " "),
+    color: { color: EDGE_COLORS[e.relation_type] || "#4b5563", highlight: "#58a6ff", hover: "#58a6ff" },
+    font:  { color: "#6e7681", size: 9, align: "middle" },
+    arrows: "to",
+    width: Math.max(1, Math.round((e.weight || 0.5) * 2.5)),
+    smooth: { type: "curvedCW", roundness: 0.15 },
+  }));
+
+  const network = new vis.Network(
+    document.getElementById("graph"),
+    { nodes: new vis.DataSet(visNodes), edges: new vis.DataSet(visEdges) },
+    {
+      physics: {
+        solver: "forceAtlas2Based",
+        forceAtlas2Based: { gravitationalConstant: -60, centralGravity: 0.005, springLength: 120, damping: 0.4 },
+        stabilization: { iterations: 200, updateInterval: 25 },
+      },
+      interaction: { hover: true, tooltipDelay: 150, navigationButtons: true, keyboard: true },
+      nodes: { borderWidth: 1 },
+      edges: { selectionWidth: 2 },
+    }
+  );
+
+  network.on("click", function (params) {
+    if (!params.nodes.length) return;
+    const node = visNodes.find(x => x.id === params.nodes[0]);
+    if (!node) return;
+    const n = node._raw;
+
+    const tags   = (n.tags || []).map(t => `<span class="badge">${t}</span>`).join("");
+    const source = n.source ? `<div class="meta">source: ${n.source}</div>` : "";
+    const imp    = `<div class="meta">importance: ${(n.importance || 0).toFixed(2)} &nbsp; tier: ${n.tier} &nbsp; type: ${n.node_type}</div>`;
+    const id_    = `<div class="meta" style="font-size:10px;color:#484f58">id: ${n.id}</div>`;
+
+    document.getElementById("panel").innerHTML =
+      `<h2>${n.node_type} / ${n.tier}</h2>${tags}${imp}${source}${id_}<pre>${(n.content || "").replace(/</g,"&lt;")}</pre>`;
+  });
+
+  network.on("stabilizationProgress", function (p) {
+    const pct = Math.round(p.iterations / p.total * 100);
+    document.getElementById("panel").innerHTML =
+      `<h2>Laying out graph\u2026</h2><p style="font-size:11px;color:#6e7681">${pct}%</p>`;
+  });
+  network.on("stabilizationIterationsDone", function () {
+    document.getElementById("panel").innerHTML =
+      `<h2>Graph Explorer</h2><p style="font-size:11px;color:#6e7681">Click any node to inspect it.</p>`;
+    network.setOptions({ physics: { enabled: false } });
+  });
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def cmd_graph(
+    collection: Optional[str] = typer.Argument(None, help="Collection to visualise (default: from config)."),
+    host: str = typer.Option("localhost", help="StixDB server host."),
+    port: int = typer.Option(0, help="StixDB server port (0 = read from config)."),
+    viewer_port: int = typer.Option(4021, "--viewer-port", "-p", help="Local port for the graph viewer (default 4021)."),
+    no_browser: bool = typer.Option(False, "--no-browser", help="Print URL only — do not open the browser automatically."),
+):
+    """
+    [bold]Open an interactive graph viewer[/bold] for a collection.
+
+    Fetches the collection graph from the running StixDB server, starts a
+    local viewer at [cyan]http://localhost:PORT[/cyan], and opens it in your
+    default browser.
+
+    Node colour = memory tier. Node shape = type (dot = fact, diamond = summary).
+    Node size   = importance. Click any node to read its full content.
+
+    Examples:
+      stixdb graph                         # view default collection
+      stixdb graph proj_myapp              # view a named collection
+      stixdb graph proj_myapp --viewer-port 8080
+      stixdb graph proj_myapp --no-browser # print URL, do not open browser
+    """
+    import threading
+    import urllib.request
+    import webbrowser
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    base, api_key = _conn(host, port)
+    coll = collection or default_collection()
+
+    # Fetch vis-network assets once and cache to ~/.stixdb/ for offline use
+    _VIS_JS_URL  = "https://cdn.jsdelivr.net/npm/vis-network@9.1.9/dist/vis-network.min.js"
+    _VIS_CSS_URL = "https://cdn.jsdelivr.net/npm/vis-network@9.1.9/styles/vis-network.min.css"
+    _cache_dir = Path.home() / ".stixdb"
+    _cache_dir.mkdir(parents=True, exist_ok=True)
+    _vis_js_cache  = _cache_dir / "vis-network.min.js"
+    _vis_css_cache = _cache_dir / "vis-network.min.css"
+
+    def _load_asset(cache_path: Path, url: str) -> bytes:
+        if cache_path.exists():
+            return cache_path.read_bytes()
+        try:
+            with urllib.request.urlopen(url, timeout=15) as r:
+                data = r.read()
+            cache_path.write_bytes(data)
+            return data
+        except Exception:
+            return b""
+
+    vis_js  = _load_asset(_vis_js_cache,  _VIS_JS_URL)
+    vis_css = _load_asset(_vis_css_cache, _VIS_CSS_URL)
+
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as prog:
+        prog.add_task(f"Fetching graph for [cyan]{coll}[/cyan]…")
+        data = http_get(f"{base}/collections/{coll}/graph", api_key)
+
+    node_count = data.get("count", len(data.get("nodes", [])))
+    edge_count = len(data.get("edges", []))
+
+    graph_json = json.dumps(data).replace("</", "<\\/")
+    html = (
+        _GRAPH_HTML
+        .replace("__COLLECTION__", coll)
+        .replace("__GRAPH_DATA__", graph_json)
+    )
+    html_bytes = html.encode("utf-8")
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/vis-network.js":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/javascript")
+                self.send_header("Content-Length", str(len(vis_js)))
+                self.end_headers()
+                self.wfile.write(vis_js)
+            elif self.path == "/vis-network.css":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/css")
+                self.send_header("Content-Length", str(len(vis_css)))
+                self.end_headers()
+                self.wfile.write(vis_css)
+            else:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html_bytes)))
+                self.end_headers()
+                self.wfile.write(html_bytes)
+
+        def log_message(self, *args):
+            pass  # suppress per-request noise
+
+    try:
+        server = HTTPServer(("127.0.0.1", viewer_port), _Handler)
+    except OSError as exc:
+        console.print(f"[red]Could not bind viewer to port {viewer_port}:[/red] {exc}")
+        console.print(f"  Try a different port:  [cyan]stixdb graph {coll} --viewer-port 8080[/cyan]")
+        raise typer.Exit(1)
+
+    url = f"http://localhost:{viewer_port}"
+
+    console.print(
+        f"\n  [bold cyan]StixDB Graph Viewer[/bold cyan]\n"
+        f"  Collection : [bold]{coll}[/bold]\n"
+        f"  Nodes      : {node_count}   Edges: {edge_count}\n"
+        f"  URL        : [cyan]{url}[/cyan]\n\n"
+        f"  Press [bold]Ctrl+C[/bold] to stop the viewer.\n"
+    )
+
+    if not no_browser:
+        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        console.print("\n  Viewer stopped.")

@@ -24,6 +24,9 @@ class AskRequest(BaseModel):
     depth: int = 2
     system_prompt: Optional[str] = None
     output_schema: Optional[dict[str, Any]] = None
+    thinking_steps: int = 1    # >1 enables multi-hop reasoning loop
+    hops_per_step: int = 4     # max retrieval hops per thinking step
+    max_tokens: Optional[int] = None  # cap LLM response length; None = use server default
 
 
 class RetrieveRequest(BaseModel):
@@ -50,6 +53,9 @@ async def ask(collection: str, body: AskRequest, request: Request):
         depth=body.depth,
         system_prompt=body.system_prompt,
         output_schema=body.output_schema,
+        thinking_steps=body.thinking_steps,
+        hops_per_step=body.hops_per_step,
+        max_tokens=body.max_tokens,
     )
     return response.to_dict()
 

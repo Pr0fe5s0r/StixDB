@@ -125,15 +125,35 @@ class Consolidator:
 
                 sim = float(np.clip(np.dot(emb_a, emb_b), -1.0, 1.0))  # Already normalised, but guard float drift
                 if sim >= threshold:
-                    summary_id = await self._merge_nodes(node_a, node_b, sim)
+                    # If one node is already a SUMMARY, absorb the other into it
+                    # rather than creating a redundant third summary node.
+                    if node_a.node_type == NodeType.SUMMARY:
+                        await self._absorb_into_summary(node_a, emb_a, node_b, sim)
+                        summary_id = node_a.id
+                        thought = (
+                            f"Absorbed node {node_b.id[:8]} into existing summary "
+                            f"{node_a.id[:8]} (similarity={sim:.3f}). "
+                            f"Summary updated: '{node_a.content[:40]}...'"
+                        )
+                    elif node_b.node_type == NodeType.SUMMARY:
+                        await self._absorb_into_summary(node_b, emb_b, node_a, sim)
+                        summary_id = node_b.id
+                        thought = (
+                            f"Absorbed node {node_a.id[:8]} into existing summary "
+                            f"{node_b.id[:8]} (similarity={sim:.3f}). "
+                            f"Summary updated: '{node_b.content[:40]}...'"
+                        )
+                    else:
+                        summary_id = await self._merge_nodes(node_a, node_b, sim)
+                        thought = (
+                            f"Merged nodes {node_a.id[:8]} and {node_b.id[:8]} "
+                            f"(similarity={sim:.3f} ≥ threshold={threshold:.3f}). "
+                            f"Both related to '{node_a.content[:40]}...' — created summary node {summary_id[:8]}."
+                        )
                     merged_ids.add(node_a.id)
                     merged_ids.add(node_b.id)
                     result.merged_pairs.append((node_a.id, node_b.id, summary_id))
-                    result.thoughts.append(
-                        f"Merged nodes {node_a.id[:8]} and {node_b.id[:8]} "
-                        f"(similarity={sim:.3f} ≥ threshold={threshold:.3f}). "
-                        f"Both related to '{node_a.content[:40]}...' — created summary node {summary_id[:8]}."
-                    )
+                    result.thoughts.append(thought)
                     break  # Only merge each node once per cycle
 
     async def _merge_nodes(self, node_a: MemoryNode, node_b: MemoryNode, similarity: float) -> str:
@@ -234,6 +254,78 @@ class Consolidator:
         )
 
         return summary_node.id
+
+    async def _absorb_into_summary(
+        self,
+        summary: MemoryNode,
+        summary_emb: np.ndarray,
+        other: MemoryNode,
+        similarity: float,
+    ) -> None:
+        """
+        Absorb a semantically similar node into an existing SUMMARY node.
+
+        Instead of creating yet another summary (which would fragment the graph),
+        we:
+          1. Update the summary's embedding to the normalised centroid of both.
+          2. Append the absorbed node's content to the summary text.
+          3. Add a DERIVED_FROM edge (summary → absorbed node) for provenance.
+          4. Archive the absorbed node so the consolidator won't revisit it.
+        """
+        other_emb = np.array(other.embedding, dtype=np.float32)
+        new_emb = (summary_emb + other_emb) / 2.0
+        norm = np.linalg.norm(new_emb)
+        if norm > 0:
+            new_emb = new_emb / norm
+        summary.set_embedding(new_emb)
+
+        # Extend summary content only if the absorbed text is not already present
+        absorbed_snippet = other.content.strip()
+        if absorbed_snippet not in summary.content:
+            summary.content = f"{summary.content.rstrip()} | {absorbed_snippet}"
+
+        # Track absorbed node in lineage metadata
+        lineage = summary.metadata.get("source_lineage", [])
+        lineage.append({
+            "node_id": other.id,
+            "source": other.source,
+            "similarity": similarity,
+            "absorbed_at": time.time(),
+        })
+        summary.metadata["source_lineage"] = lineage
+        merged_from = list(summary.metadata.get("merged_from", []))
+        if other.id not in merged_from:
+            merged_from.append(other.id)
+        summary.metadata["merged_from"] = merged_from
+        summary.metadata["last_absorbed_at"] = time.time()
+
+        # Persist updated summary
+        await self.graph._storage.upsert_node(summary)
+        await self.graph._vector_store.upsert(
+            collection=self.graph.collection,
+            node_id=summary.id,
+            embedding=new_emb,
+            content=summary.content,
+        )
+
+        # Lineage edge: summary → absorbed node
+        await self.graph.add_edge(
+            summary.id, other.id,
+            relation_type=RelationType.DERIVED_FROM,
+            weight=similarity,
+            created_by="agent",
+        )
+
+        # Archive the absorbed node
+        other.tier = MemoryTier.ARCHIVED
+        other.importance *= 0.5
+        if self.config.lineage_safe_mode:
+            other.pinned = True
+            other.metadata["lineage_preserved"] = True
+            other.metadata["lineage_summary_ids"] = sorted(
+                set(other.metadata.get("lineage_summary_ids", [])) | {summary.id}
+            )
+        await self.graph.update_node(other)
 
     async def _prune_exact_duplicates(self, result: ConsolidationResult) -> None:
         nodes = await self.graph.list_nodes(limit=5000)
