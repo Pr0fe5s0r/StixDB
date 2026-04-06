@@ -695,6 +695,81 @@ class Reasoner:
             response.raise_for_status()
             return response.json()["response"]
 
+    async def synthesize_nodes(self, nodes: list[MemoryNode]) -> str:
+        """
+        Synthesize a concise summary from a cluster of semantically related nodes.
+        Returns plain text. Used by the Consolidator for LLM-backed merge summaries.
+        Falls back to empty string silently so the consolidator can use concatenation.
+        """
+        if not nodes or self.config.provider == LLMProvider.NONE:
+            return ""
+        snippets = "\n\n".join(
+            f"[{i + 1}] {n.content.strip()[:400]}" for i, n in enumerate(nodes[:8])
+        )
+        prompt = (
+            f"These {len(nodes)} memory fragments are semantically related. "
+            "Write a single concise synthesis (2-4 sentences) capturing the key facts. "
+            "Include only information present in the sources. No preamble.\n\n"
+            f"{snippets}"
+        )
+        return await self._call_plain_completion(prompt, max_tokens=300)
+
+    async def _call_plain_completion(self, prompt: str, max_tokens: int = 300) -> str:
+        """
+        Make a raw LLM call and return plain text (no JSON format enforcement).
+        Used for synthesis tasks that don't need structured output.
+        """
+        provider = self.config.provider
+        system = "You are a memory consolidation assistant. Be factual and concise."
+        try:
+            if provider in (LLMProvider.OPENAI, LLMProvider.CUSTOM):
+                import openai
+                api_key = (
+                    self.config.openai_api_key
+                    if provider == LLMProvider.OPENAI
+                    else (self.config.custom_api_key or "dummy-key")
+                )
+                base_url = None if provider == LLMProvider.OPENAI else self.config.custom_base_url
+                client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
+                response = await client.chat.completions.create(
+                    model=self.config.model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.1,
+                    max_tokens=max_tokens,
+                    timeout=self.config.timeout_seconds,
+                )
+                return (response.choices[0].message.content or "").strip()
+            elif provider == LLMProvider.ANTHROPIC:
+                import anthropic
+                client = anthropic.AsyncAnthropic(api_key=self.config.anthropic_api_key)
+                message = await client.messages.create(
+                    model=self.config.model,
+                    max_tokens=max_tokens,
+                    system=system,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return message.content[0].text.strip() if message.content else ""
+            elif provider == LLMProvider.OLLAMA:
+                import httpx
+                async with httpx.AsyncClient(timeout=self.config.timeout_seconds) as client:
+                    response = await client.post(
+                        f"{self.config.ollama_base_url}/api/generate",
+                        json={
+                            "model": self.config.model,
+                            "prompt": f"{system}\n\n{prompt}",
+                            "stream": False,
+                            "options": {"num_predict": max_tokens, "temperature": 0.1},
+                        },
+                    )
+                    response.raise_for_status()
+                    return response.json().get("response", "").strip()
+        except Exception:
+            return ""
+        return ""
+
     def _heuristic_fallback(self, question: str, nodes: list[MemoryNode]) -> str:
         """
         When no LLM is configured, return the most relevant nodes as a

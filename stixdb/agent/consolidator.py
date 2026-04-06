@@ -13,7 +13,8 @@ decision it makes, so engineers can understand why memory was reorganised.
 from __future__ import annotations
 
 import time
-from typing import Optional
+from collections import defaultdict
+from typing import Awaitable, Callable, Optional
 
 import numpy as np
 
@@ -50,9 +51,16 @@ class Consolidator:
     compact, coherent, and high-quality.
     """
 
-    def __init__(self, graph: MemoryGraph, config: AgentConfig) -> None:
+    def __init__(
+        self,
+        graph: MemoryGraph,
+        config: AgentConfig,
+        synthesize_fn: Optional[Callable[[list], Awaitable[str]]] = None,
+    ) -> None:
         self.graph = graph
         self.config = config
+        self._synthesize_fn = synthesize_fn   # optional LLM synthesis hook
+        self._cycle = 0                        # rotation counter for exploration
         self._tracer = get_tracer()
 
     async def run_cycle(self) -> ConsolidationResult:
@@ -76,6 +84,9 @@ class Consolidator:
         # Phase 3: Update clusters
         await self._rebuild_clusters(result)
 
+        # Advance exploration cursor so the next cycle samples a different slice
+        self._cycle += 1
+
         # Emit consolidated trace
         self._tracer.record_consolidation(
             collection=self.graph.collection,
@@ -91,70 +102,256 @@ class Consolidator:
     # ------------------------------------------------------------------ #
 
     async def _find_and_merge(self, result: ConsolidationResult) -> None:
-        """Identify semantically similar nodes and merge them."""
+        """
+        Identify semantically similar nodes and merge them into summaries.
+
+        Improvements over the naive approach:
+        - Rotating offset sampling ensures every cycle explores a DIFFERENT
+          slice of the collection, so all nodes get explored over time.
+        - Multi-tier sampling includes working-tier (hot/recent) nodes
+          alongside semantic and episodic nodes.
+        - Union-Find clustering groups ALL mutually similar nodes in the
+          batch into one summary per cluster — not just pairwise merges.
+        - Optional LLM synthesis generates meaningful summary text instead
+          of a raw concatenation.
+        """
         threshold = self.config.consolidation_similarity_threshold
-        batch_size = self.config.max_consolidation_batch
 
-        # Fetch a representative batch of non-pinned semantic/episodic nodes
-        candidates = await self.graph.list_nodes(
-            tier="semantic", limit=batch_size // 2
-        )
-        candidates += await self.graph.list_nodes(
-            tier="episodic", limit=batch_size // 2
-        )
-
-        # Filter nodes that have embeddings
-        embedded = [(n, np.array(n.embedding, dtype=np.float32))
-                    for n in candidates if n.embedding is not None and not n.pinned]
-
+        # ── 1. Sample a rotating, multi-tier batch ──────────────────────
+        candidates = await self._sample_candidates()
+        embedded = [
+            (n, np.array(n.embedding, dtype=np.float32))
+            for n in candidates
+            if n.embedding is not None and not n.pinned
+        ]
         if len(embedded) < 2:
             return
 
-        # Pairwise cosine similarity check (upper triangle only)
-        merged_ids: set[str] = set()
+        # ── 2. Build similarity adjacency (pairwise upper-triangle) ─────
+        adj: dict[str, set[str]] = defaultdict(set)
+        best_sim: dict[str, float] = {}  # node_id → max similarity seen
 
         for i in range(len(embedded)):
-            if embedded[i][0].id in merged_ids:
-                continue
             node_a, emb_a = embedded[i]
-
             for j in range(i + 1, len(embedded)):
-                if embedded[j][0].id in merged_ids:
-                    continue
                 node_b, emb_b = embedded[j]
-
-                sim = float(np.clip(np.dot(emb_a, emb_b), -1.0, 1.0))  # Already normalised, but guard float drift
+                sim = float(np.clip(np.dot(emb_a, emb_b), -1.0, 1.0))
                 if sim >= threshold:
-                    # If one node is already a SUMMARY, absorb the other into it
-                    # rather than creating a redundant third summary node.
-                    if node_a.node_type == NodeType.SUMMARY:
-                        await self._absorb_into_summary(node_a, emb_a, node_b, sim)
-                        summary_id = node_a.id
-                        thought = (
-                            f"Absorbed node {node_b.id[:8]} into existing summary "
-                            f"{node_a.id[:8]} (similarity={sim:.3f}). "
-                            f"Summary updated: '{node_a.content[:40]}...'"
-                        )
-                    elif node_b.node_type == NodeType.SUMMARY:
-                        await self._absorb_into_summary(node_b, emb_b, node_a, sim)
-                        summary_id = node_b.id
-                        thought = (
-                            f"Absorbed node {node_a.id[:8]} into existing summary "
-                            f"{node_b.id[:8]} (similarity={sim:.3f}). "
-                            f"Summary updated: '{node_b.content[:40]}...'"
-                        )
-                    else:
-                        summary_id = await self._merge_nodes(node_a, node_b, sim)
-                        thought = (
-                            f"Merged nodes {node_a.id[:8]} and {node_b.id[:8]} "
-                            f"(similarity={sim:.3f} ≥ threshold={threshold:.3f}). "
-                            f"Both related to '{node_a.content[:40]}...' — created summary node {summary_id[:8]}."
-                        )
-                    merged_ids.add(node_a.id)
-                    merged_ids.add(node_b.id)
-                    result.merged_pairs.append((node_a.id, node_b.id, summary_id))
-                    result.thoughts.append(thought)
-                    break  # Only merge each node once per cycle
+                    adj[node_a.id].add(node_b.id)
+                    adj[node_b.id].add(node_a.id)
+                    best_sim[node_a.id] = max(best_sim.get(node_a.id, 0.0), sim)
+                    best_sim[node_b.id] = max(best_sim.get(node_b.id, 0.0), sim)
+
+        if not adj:
+            return
+
+        # ── 3. Find connected clusters via BFS ───────────────────────────
+        id_to_item = {n.id: (n, emb) for n, emb in embedded}
+        clusters = self._find_clusters(embedded, adj)
+
+        # ── 4. Merge each cluster ────────────────────────────────────────
+        merged_ids: set[str] = set()
+        for cluster in clusters:
+            # Skip if any member was already merged this cycle
+            if any(n.id in merged_ids for n, _ in cluster):
+                continue
+
+            avg_sim = float(np.mean([best_sim.get(n.id, threshold) for n, _ in cluster]))
+
+            # If an existing SUMMARY is in the cluster, absorb the rest into it
+            summary_nodes = [n for n, _ in cluster if n.node_type == NodeType.SUMMARY and not n.pinned]
+            if summary_nodes:
+                anchor = summary_nodes[0]
+                anchor_emb = id_to_item[anchor.id][1]
+                others = [(n, emb) for n, emb in cluster if n.id != anchor.id]
+                for other_node, _ in others:
+                    await self._absorb_into_summary(anchor, anchor_emb, other_node, avg_sim)
+                    merged_ids.add(other_node.id)
+                    # Re-compute anchor embedding for next absorption
+                    anchor_emb = np.array(anchor.embedding, dtype=np.float32)
+                merged_ids.add(anchor.id)
+                ids = [n.id[:8] for n, _ in cluster]
+                result.merged_pairs.append((anchor.id, others[0][0].id if others else anchor.id, anchor.id))
+                result.thoughts.append(
+                    f"Absorbed {len(others)} node(s) into summary {anchor.id[:8]} "
+                    f"(cluster size={len(cluster)}, avg_sim={avg_sim:.3f}). "
+                    f"Members: {', '.join(ids)}"
+                )
+            else:
+                # All new nodes — create one summary for the whole cluster
+                summary_id = await self._merge_cluster(cluster, avg_sim)
+                for n, _ in cluster:
+                    merged_ids.add(n.id)
+                ids = [n.id[:8] for n, _ in cluster]
+                result.merged_pairs.append((cluster[0][0].id, cluster[1][0].id, summary_id))
+                result.thoughts.append(
+                    f"Merged cluster of {len(cluster)} nodes into summary {summary_id[:8]} "
+                    f"(avg_sim={avg_sim:.3f}, threshold={threshold:.3f}). "
+                    f"Members: {', '.join(ids)}"
+                )
+
+    # ── Exploration helpers ────────────────────────────────────────────────
+
+    async def _sample_candidates(self) -> list:
+        """
+        Sample a rotating, importance-weighted batch from all active tiers.
+
+        The rotation offset advances by (batch // 3) each cycle so that:
+          - Cycle 0 sees nodes 0..N
+          - Cycle 1 sees nodes N..2N
+          - Cycle K wraps back around
+        Working-tier nodes are always included (they're hot/recent).
+        """
+        batch = self.config.max_consolidation_batch
+        per_tier = max(4, batch // 3)
+        offset = (self._cycle * per_tier) % max(1, per_tier * 10)
+
+        # Hot nodes always included — they're recently accessed and likely co-relevant
+        working  = await self.graph.list_nodes(tier="working",  limit=per_tier,     offset=0)
+        semantic = await self.graph.list_nodes(tier="semantic", limit=per_tier,     offset=offset)
+        episodic = await self.graph.list_nodes(tier="episodic", limit=per_tier * 2, offset=offset)
+
+        seen: set[str] = set()
+        merged: list = []
+        for node in working + semantic + episodic:
+            if node.id not in seen:
+                seen.add(node.id)
+                merged.append(node)
+
+        # Bias toward high-importance nodes within the batch
+        merged.sort(key=lambda n: n.importance, reverse=True)
+        return merged[:batch]
+
+    @staticmethod
+    def _find_clusters(
+        embedded: list,
+        adj: dict[str, set[str]],
+    ) -> list[list]:
+        """
+        Group similar nodes into connected clusters (BFS on the adjacency graph).
+        Returns only clusters with >= 2 members.
+        """
+        visited: set[str] = set()
+        clusters: list[list] = []
+        id_to_item = {n.id: (n, emb) for n, emb in embedded}
+
+        for node, _ in embedded:
+            if node.id in visited or node.id not in adj:
+                continue
+            # BFS
+            cluster_ids: list[str] = []
+            queue = [node.id]
+            while queue:
+                nid = queue.pop()
+                if nid in visited:
+                    continue
+                visited.add(nid)
+                cluster_ids.append(nid)
+                for neighbor in adj.get(nid, set()):
+                    if neighbor not in visited:
+                        queue.append(neighbor)
+            if len(cluster_ids) >= 2:
+                clusters.append([id_to_item[nid] for nid in cluster_ids if nid in id_to_item])
+
+        return clusters
+
+    async def _merge_cluster(self, cluster: list, avg_similarity: float) -> str:
+        """
+        Create one SUMMARY node from an entire cluster of similar nodes.
+        Uses LLM synthesis when available, concatenation otherwise.
+        """
+        nodes = [n for n, _ in cluster]
+
+        def lineage_entry(node) -> dict:
+            meta = node.metadata or {}
+            return {
+                "node_id": node.id,
+                "source": node.source,
+                "filepath": meta.get("filepath"),
+                "char_start": meta.get("char_start"),
+                "char_end": meta.get("char_end"),
+                "created_at": node.created_at,
+            }
+
+        combined_content = await self._build_summary_content(nodes)
+
+        # Centroid embedding across all members
+        embs = [np.array(n.embedding, dtype=np.float32) for n in nodes if n.embedding]
+        avg_emb = np.mean(embs, axis=0).astype(np.float32) if embs else None
+        if avg_emb is not None:
+            norm = np.linalg.norm(avg_emb)
+            if norm > 0:
+                avg_emb = avg_emb / norm
+
+        combined_importance = max(n.importance for n in nodes) * 0.95
+
+        summary_node = MemoryNode(
+            collection=self.graph.collection,
+            content=combined_content,
+            node_type=NodeType.SUMMARY,
+            tier=MemoryTier.SEMANTIC,
+            importance=combined_importance,
+            parent_node_ids=[n.id for n in nodes],
+            source="agent-consolidator",
+            metadata={
+                "merged_from": [n.id for n in nodes],
+                "cluster_size": len(nodes),
+                "avg_similarity": avg_similarity,
+                "merged_at": time.time(),
+                "source_lineage": [lineage_entry(n) for n in nodes],
+                "llm_synthesized": self._synthesize_fn is not None,
+            },
+        )
+        if avg_emb is not None:
+            summary_node.set_embedding(avg_emb)
+
+        await self.graph._storage.upsert_node(summary_node)
+        if avg_emb is not None:
+            await self.graph._vector_store.upsert(
+                collection=self.graph.collection,
+                node_id=summary_node.id,
+                embedding=avg_emb,
+                content=summary_node.content,
+            )
+
+        # Archive all source nodes and create lineage edges
+        for node in nodes:
+            node.tier = MemoryTier.ARCHIVED
+            node.importance *= 0.5
+            if self.config.lineage_safe_mode:
+                node.pinned = True
+                node.metadata = node.metadata or {}
+                node.metadata["lineage_preserved"] = True
+                node.metadata["lineage_summary_ids"] = sorted(
+                    set(node.metadata.get("lineage_summary_ids", [])) | {summary_node.id}
+                )
+            await self.graph.update_node(node)
+            await self.graph.add_edge(
+                summary_node.id, node.id,
+                relation_type=RelationType.DERIVED_FROM,
+                weight=avg_similarity,
+                created_by="agent",
+            )
+
+        return summary_node.id
+
+    async def _build_summary_content(self, nodes: list) -> str:
+        """
+        Build summary text for a cluster of nodes.
+        Uses LLM synthesis when a synthesize_fn is wired up; falls back
+        to structured concatenation otherwise.
+        """
+        if self._synthesize_fn is not None:
+            try:
+                result = await self._synthesize_fn(nodes)
+                if result and result.strip():
+                    return result.strip()
+            except Exception:
+                pass  # fall through to concatenation
+
+        # Concatenation fallback — more structured than a bare join
+        parts = [n.content.strip() for n in nodes]
+        return "[SUMMARY] " + " | ".join(parts)
 
     async def _merge_nodes(self, node_a: MemoryNode, node_b: MemoryNode, similarity: float) -> str:
         """

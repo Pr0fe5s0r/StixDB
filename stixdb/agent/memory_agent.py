@@ -12,7 +12,7 @@ without needing to know the internals.
 """
 from __future__ import annotations
 
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from stixdb.graph.memory_graph import MemoryGraph
 from stixdb.agent.planner import AccessPlanner
@@ -32,12 +32,17 @@ class MemoryAgent:
         await agent.stop()    # graceful shutdown
     """
 
-    def __init__(self, graph: MemoryGraph, config: AgentConfig) -> None:
+    def __init__(
+        self,
+        graph: MemoryGraph,
+        config: AgentConfig,
+        synthesize_fn: Optional[Callable[[list[Any]], Awaitable[str]]] = None,
+    ) -> None:
         self.graph = graph
         self.config = config
 
         self.planner = AccessPlanner(graph, config)
-        self.consolidator = Consolidator(graph, config)
+        self.consolidator = Consolidator(graph, config, synthesize_fn=synthesize_fn)
         self.worker = MemoryAgentWorker(
             graph=graph,
             planner=self.planner,

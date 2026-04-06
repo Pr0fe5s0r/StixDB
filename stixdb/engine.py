@@ -200,6 +200,14 @@ class StixDBEngine:
                 reasoner_config=self.config.reasoner,
                 verbose=self.config.verbose,
             )
+
+            # Patch LLM synthesis into the consolidator now that the broker
+            # (and its reasoner) exists. The consolidator uses this to generate
+            # meaningful summaries instead of raw concatenations.
+            async def _synthesize(nodes, _r=broker.reasoner):
+                return await _r.synthesize_nodes(nodes)
+            agent.consolidator._synthesize_fn = _synthesize
+
             async def maintenance_callback(bound_collection: str = collection) -> dict:
                 return await self._run_collection_maintenance(bound_collection)
             agent.set_maintenance_callback(maintenance_callback)
