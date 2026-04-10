@@ -112,6 +112,7 @@ class NetworkXBackend(StorageBackend):
         node_type: Optional[str] = None,
         limit: int = 1000,
         offset: int = 0,
+        include_embedding: bool = False,
     ) -> list[MemoryNode]:
         nodes = list(self._nodes[collection].values())
         if tier:

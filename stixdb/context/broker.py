@@ -18,6 +18,7 @@ a structured, reasoned answer, not a bag of documents.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Optional
 
@@ -83,6 +84,14 @@ class ContextBroker:
             ContextResponse with answer, reasoning trace, and sources.
         """
         start = time.time()
+        is_maintenance = query_origin == "maintenance"
+
+        # ── Phase 0: Predictive pre-warm ─────────────────────────────────
+        # Embed the query first. Prefetch is best-effort and must never block
+        # the live retrieval path.
+        query_embedding = await self.graph._embedding_client.embed_text(question)
+        if self.agent.config.enable_predictive_prefetch and not is_maintenance:
+            asyncio.create_task(self.agent.prefetch_for_query(query_embedding))
 
         # ── Phase 1-3: Prepare Context ───────────────────────────────────
         final_nodes, final_scores, candidates = await self.prepare_context(
@@ -94,9 +103,17 @@ class ContextBroker:
         )
 
         # ── Phase 4: Notify agent of access events ────────────────────────
-        for node in final_nodes:
-            self.agent.record_access(node.id)
-            await self.graph.touch_node(node.id)
+        if not is_maintenance:
+            for node in final_nodes:
+                self.agent.record_access(node.id)
+                await self.graph.touch_node(node.id)
+
+            # Feed retrieved node IDs back into the prefetcher's pattern history
+            # so future similar queries benefit from this retrieval
+            self.agent.record_query_for_prefetch(
+                query_embedding=query_embedding,
+                retrieved_node_ids=[n.id for n in final_nodes],
+            )
 
         # ── Phase 5: LLM Reasoning ───────────────────────────────────────
         reasoning_result = await self.reasoner.reason(
@@ -108,6 +125,9 @@ class ContextBroker:
             output_schema=output_schema,
             temperature=temperature,
             max_tokens=max_tokens,
+            timeout_seconds=20.0 if query_origin != "maintenance" else None,
+            max_attempts=1 if query_origin != "maintenance" else 3,
+            fast_mode=(query_origin != "maintenance"),
         )
 
         latency_ms = (time.time() - start) * 1000.0
@@ -202,8 +222,6 @@ class ContextBroker:
             threshold=threshold,
             depth=depth,
         )
-        for node, _ in candidates:
-            self.agent.record_access(node.id)
         return candidates
 
     # ------------------------------------------------------------------ #

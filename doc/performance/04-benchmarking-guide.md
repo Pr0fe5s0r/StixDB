@@ -4,6 +4,8 @@
 
 `scripts/benchmarks/benchmark_streaming.py` was created to measure where latency actually comes from in the StixDB chat path.
 
+`scripts/benchmarks/benchmark_retrieval.py` was added to compare the pure vector path (`depth=0`) against the graph-aware path (`depth=1`) and report p50/p95 latency for both.
+
 It helps separate:
 
 - basic server health latency
@@ -16,6 +18,7 @@ It helps separate:
 ## File
 
 - `scripts/benchmarks/benchmark_streaming.py`
+- `scripts/benchmarks/benchmark_retrieval.py`
 
 ## Default Target
 
@@ -56,6 +59,17 @@ Reported fields include:
 - result count
 - top scores
 - top node ids
+
+The retrieval benchmark script runs the same query twice:
+
+- vector-only: `depth=0`
+- graph-aware: `depth=1`
+
+It reports:
+
+- server-side p50/p95
+- wall-clock p50/p95
+- the delta between the two paths
 
 ### Non-stream chat
 
@@ -115,6 +129,18 @@ Custom prompt:
 
 ```bash
 python scripts/benchmarks/benchmark_streaming.py --model demo --prompt "What is StixDB? Answer in one short sentence."
+```
+
+Retrieval comparison:
+
+```bash
+python scripts/benchmarks/benchmark_retrieval.py --collection main --query "alpha summary primary"
+```
+
+JSON output:
+
+```bash
+python scripts/benchmarks/benchmark_retrieval.py --json
 ```
 
 ## How To Interpret Results

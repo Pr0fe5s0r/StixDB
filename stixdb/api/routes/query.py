@@ -6,11 +6,11 @@ POST /collections/{name}/retrieve  — raw retrieval without LLM reasoning
 """
 from __future__ import annotations
 
-from typing import Optional
+from time import perf_counter
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
-from typing import Optional, Any
+from typing import Any, Optional
 
 from stixdb.engine import StixDBEngine
 
@@ -67,6 +67,7 @@ async def retrieve(collection: str, body: RetrieveRequest, request: Request):
     Returns ranked memory nodes for the calling agent to process.
     """
     engine: StixDBEngine = request.app.state.engine
+    start = perf_counter()
     nodes = await engine.retrieve(
         collection=collection,
         query=body.query,
@@ -74,9 +75,11 @@ async def retrieve(collection: str, body: RetrieveRequest, request: Request):
         threshold=body.threshold,
         depth=body.depth,
     )
+    latency_ms = (perf_counter() - start) * 1000.0
     return {
         "collection": collection,
         "query": body.query,
         "results": nodes,
         "count": len(nodes),
+        "latency_ms": latency_ms,
     }

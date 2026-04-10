@@ -41,7 +41,7 @@ This folder documents both the overall StixDB application architecture and the f
   Describes the new opt-in `verbose` mode on the OpenAI-compatible chat API for progress updates during streaming.
 
 - `performance/04-benchmarking-guide.md`
-  Documents the `scripts/benchmarks/benchmark_streaming.py` tool, the metrics it collects, and how to interpret the numbers.
+  Documents the `scripts/benchmarks/benchmark_streaming.py` and `scripts/benchmarks/benchmark_retrieval.py` tools, the metrics they collect, and how to interpret the numbers.
 
 ## Scope
 

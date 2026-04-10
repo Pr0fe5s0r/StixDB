@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 from enum import Enum
+from pathlib import Path
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -54,6 +55,69 @@ class AgentConfig(BaseModel):
         description="Protect source nodes that contribute to summaries from later pruning.",
     )
 
+    # ── Synthesis zone ────────────────────────────────────────────────────
+    synthesis_similarity_lower: float = Field(
+        0.55, ge=0.2, le=0.95,
+        description=(
+            "Lower bound of the synthesis zone. Node pairs with similarity between "
+            "this value and consolidation_similarity_threshold get a synthesis "
+            "SUMMARY node created WITHOUT archiving the originals. This is the "
+            "primary mechanism for building higher-level abstractions."
+        ),
+    )
+    max_synthesis_batch: int = Field(
+        40, ge=4,
+        description="Max pairs synthesized per cycle (LLM calls are expensive).",
+    )
+
+    # ── Librarian Agent: RelationWeaver ───────────────────────────────────
+    enable_relation_weaving: bool = Field(
+        True,
+        description="Enable autonomous relation discovery between related-but-distinct nodes.",
+    )
+    relation_similarity_lower: float = Field(
+        0.40, ge=0.1, le=0.9,
+        description="Lower bound of the relation band. Pairs below this are unrelated.",
+    )
+    weaver_batch_size: int = Field(
+        60, ge=8,
+        description="Nodes sampled per weaver pass (total across tiers).",
+    )
+    weaver_batch_limit: int = Field(
+        20, ge=1,
+        description="Max pairs classified (and potentially woven) per weaver pass.",
+    )
+
+    # ── Librarian Agent: PredictivePrefetcher ─────────────────────────────
+    enable_predictive_prefetch: bool = Field(
+        True,
+        description="Enable proactive working-memory pre-warming from past query patterns.",
+    )
+    prefetch_history_size: int = Field(
+        50, ge=5,
+        description="Rolling window of past queries kept for pattern matching.",
+    )
+    prefetch_top_k_records: int = Field(
+        5, ge=1,
+        description="Top-K most similar past queries used for prefetch decisions.",
+    )
+    prefetch_max_promote: int = Field(
+        30, ge=1,
+        description="Max nodes promoted to working memory per pattern-prefetch pass.",
+    )
+    enable_neighbor_fanout: bool = Field(
+        True,
+        description="Fan out from hot nodes: pre-promote their graph neighbors.",
+    )
+    fanout_hot_node_limit: int = Field(
+        10, ge=1,
+        description="Max hot nodes fanned-out from per cycle.",
+    )
+    prefetch_max_fanout: int = Field(
+        20, ge=1,
+        description="Max total nodes promoted via neighbor fan-out per cycle.",
+    )
+
 
 class ReasonerConfig(BaseModel):
     """Configuration for the LLM-backed Reasoner."""
@@ -82,11 +146,12 @@ class StorageConfig(BaseModel):
     """
     mode: StorageMode = StorageMode.MEMORY
     data_dir: str = "./stixdb_data"
-    vector_backend: VectorBackend = VectorBackend.MEMORY
+    vector_backend: VectorBackend = VectorBackend.QDRANT
     # KuzuDB settings (local dev, no Docker needed)
     kuzu_path: str = "./stixdb_data/kuzu"
-    # Qdrant settings (docker: qdrant service)
-    qdrant_host: str = "localhost"
+    kuzu_buffer_pool_mb: int = 256
+    # Qdrant settings (empty host = embedded local path under data_dir/qdrant)
+    qdrant_host: str = ""
     qdrant_port: int = 6333
     # Chroma settings (docker: chroma service)
     chroma_host: Optional[str] = None
@@ -207,6 +272,7 @@ class StorageFileConfig(BaseModel):
     """Storage config stored in config.json."""
     mode: str = "kuzu"                  # "kuzu"|"memory"|"neo4j"
     path: str = "./stixdb_data"
+    kuzu_buffer_pool_mb: int = 256
     neo4j_uri: Optional[str] = None
     neo4j_user_env: Optional[str] = None
     neo4j_password_env: Optional[str] = None
@@ -234,6 +300,20 @@ class AgentFileConfig(BaseModel):
     max_consolidation_batch: int = 64      # nodes processed per consolidation cycle
     auto_summarize: bool = True            # auto-summarise large node clusters
     lineage_safe_mode: bool = True         # protect source nodes from post-summary pruning
+    # Synthesis zone
+    synthesis_similarity_lower: float = 0.55
+    max_synthesis_batch: int = 40
+    # Librarian Agent — RelationWeaver
+    enable_relation_weaving: bool = True
+    relation_similarity_lower: float = 0.40
+    weaver_batch_size: int = 60
+    weaver_batch_limit: int = 20
+    # Librarian Agent — PredictivePrefetcher
+    enable_predictive_prefetch: bool = True
+    prefetch_history_size: int = 50
+    prefetch_max_promote: int = 30
+    enable_neighbor_fanout: bool = True
+    prefetch_max_fanout: int = 20
 
 
 class ObservabilityFileConfig(BaseModel):
@@ -419,6 +499,7 @@ class StixDBConfig(BaseModel):
             data_dir=data_dir,
             vector_backend=base.storage.vector_backend,
             kuzu_path=os.path.join(data_dir, "kuzu"),
+            kuzu_buffer_pool_mb=cf.storage.kuzu_buffer_pool_mb or base.storage.kuzu_buffer_pool_mb,
             neo4j_uri=cf.storage.neo4j_uri or base.storage.neo4j_uri,
             neo4j_user=os.getenv(cf.storage.neo4j_user_env, "neo4j") if cf.storage.neo4j_user_env else base.storage.neo4j_user,
             neo4j_password=os.getenv(cf.storage.neo4j_password_env, "password") if cf.storage.neo4j_password_env else base.storage.neo4j_password,
@@ -444,6 +525,17 @@ class StixDBConfig(BaseModel):
             max_consolidation_batch=cf.agent.max_consolidation_batch,
             enable_auto_summarize=cf.agent.auto_summarize,
             lineage_safe_mode=cf.agent.lineage_safe_mode,
+            synthesis_similarity_lower=cf.agent.synthesis_similarity_lower,
+            max_synthesis_batch=cf.agent.max_synthesis_batch,
+            enable_relation_weaving=cf.agent.enable_relation_weaving,
+            relation_similarity_lower=cf.agent.relation_similarity_lower,
+            weaver_batch_size=cf.agent.weaver_batch_size,
+            weaver_batch_limit=cf.agent.weaver_batch_limit,
+            enable_predictive_prefetch=cf.agent.enable_predictive_prefetch,
+            prefetch_history_size=cf.agent.prefetch_history_size,
+            prefetch_max_promote=cf.agent.prefetch_max_promote,
+            enable_neighbor_fanout=cf.agent.enable_neighbor_fanout,
+            prefetch_max_fanout=cf.agent.prefetch_max_fanout,
         )
 
         # ── Observability ─────────────────────────────────────────────────────
@@ -479,7 +571,7 @@ class StixDBConfig(BaseModel):
         model = _e("STIXDB_LLM_MODEL", "gpt-4o")
         storage_mode = StorageMode(_e("STIXDB_STORAGE_MODE", "memory"))
         data_dir = _e("STIXDB_DATA_DIR", "./stixdb_data")
-        vector_backend = VectorBackend(_e("STIXDB_VECTOR_BACKEND", "memory"))
+        vector_backend = VectorBackend(_e("STIXDB_VECTOR_BACKEND", "qdrant"))
 
         return cls(
             agent=AgentConfig(
@@ -511,7 +603,8 @@ class StixDBConfig(BaseModel):
                 data_dir=data_dir,
                 vector_backend=vector_backend,
                 kuzu_path=_e("STIXDB_KUZU_PATH", os.path.join(data_dir, "kuzu")),
-                qdrant_host=_e("QDRANT_HOST", "localhost"),
+                kuzu_buffer_pool_mb=int(_e("STIXDB_KUZU_BUFFER_POOL_MB", "256")),
+                qdrant_host=_e("QDRANT_HOST", ""),
                 qdrant_port=int(_e("QDRANT_PORT", "6333")),
                 chroma_host=os.getenv("CHROMA_HOST") or None,
                 neo4j_uri=_e("NEO4J_URI", "bolt://localhost:7687"),

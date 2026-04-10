@@ -1,3 +1,4 @@
+
 """
 Consolidator — autonomous memory consolidation and pruning.
 
@@ -22,6 +23,11 @@ from stixdb.graph.node import MemoryNode, NodeType, MemoryTier
 from stixdb.graph.edge import RelationEdge, RelationType
 from stixdb.graph.cluster import MemoryCluster, ClusterType
 from stixdb.graph.memory_graph import MemoryGraph
+from stixdb.graph.summary_index import (
+    build_connection_entries,
+    build_summary_connection_index,
+    merge_summary_connection_index,
+)
 from stixdb.config import AgentConfig
 from stixdb.observability.tracer import get_tracer
 
@@ -30,6 +36,7 @@ class ConsolidationResult:
     """Result report from a single consolidation cycle."""
     def __init__(self) -> None:
         self.merged_pairs: list[tuple[str, str, str]] = []   # (src_id, tgt_id, summary_id)
+        self.synthesized_summaries: list[str] = []           # summary node IDs created by synthesis zone
         self.pruned_node_ids: list[str] = []
         self.new_clusters: list[str] = []
         self.thoughts: list[str] = []    # Human-readable agent reasoning
@@ -37,6 +44,7 @@ class ConsolidationResult:
     def to_dict(self) -> dict:
         return {
             "merged_count": len(self.merged_pairs),
+            "synthesized_count": len(self.synthesized_summaries),
             "pruned_count": len(self.pruned_node_ids),
             "new_clusters": len(self.new_clusters),
             "thoughts": self.thoughts,
@@ -66,16 +74,21 @@ class Consolidator:
     async def run_cycle(self) -> ConsolidationResult:
         """
         Run one full consolidation cycle:
-        1. Find merge candidates (high semantic similarity)
-        2. Prune dead nodes (low decay score, not pinned)
-        3. Build/update clusters
+        1.  Merge candidates (sim >= consolidation_threshold) — deduplicate, archive originals
+        1b. Synthesize candidates (synthesis_lower <= sim < threshold) — build abstractions, KEEP originals
+        1c. Remove exact duplicates
+        2.  Prune dead nodes
+        3.  Rebuild clusters
         """
         result = ConsolidationResult()
 
-        # Phase 1: Merge candidates
+        # Phase 1: Merge (deduplication — high similarity, archive originals)
         await self._find_and_merge(result)
 
-        # Phase 1b: Remove exact duplicates while keeping one canonical node.
+        # Phase 1b: Synthesize (abstraction — medium similarity, originals kept)
+        await self._synthesize_zone(result)
+
+        # Phase 1c: Remove exact duplicates
         await self._prune_exact_duplicates(result)
 
         # Phase 2: Prune dead nodes
@@ -300,7 +313,27 @@ class Consolidator:
                 "merged_at": time.time(),
                 "source_lineage": [lineage_entry(n) for n in nodes],
                 "llm_synthesized": self._synthesize_fn is not None,
+                "connection_index": build_summary_connection_index(
+                    summary_id=None,
+                    summary_kind="cluster_merge",
+                    source="agent-consolidator",
+                    content_hash=self.graph._hash_text(combined_content),
+                    entries=build_connection_entries(
+                        [n.id for n in nodes],
+                        relation_type=RelationType.DERIVED_FROM,
+                        role="source",
+                        weight=max(0.5, avg_similarity),
+                        source="agent-consolidator",
+                    ),
+                ),
             },
+        )
+        summary_node.metadata["connection_index"] = build_summary_connection_index(
+            summary_id=summary_node.id,
+            summary_kind="cluster_merge",
+            source="agent-consolidator",
+            content_hash=self.graph._hash_text(combined_content),
+            entries=summary_node.metadata["connection_index"]["entries"],
         )
         if avg_emb is not None:
             summary_node.set_embedding(avg_emb)
@@ -403,7 +436,27 @@ class Consolidator:
                 "similarity": similarity,
                 "merged_at": time.time(),
                 "source_lineage": [lineage_entry(node_a), lineage_entry(node_b)],
+                "connection_index": build_summary_connection_index(
+                    summary_id=None,
+                    summary_kind="pair_merge",
+                    source="agent-consolidator",
+                    content_hash=self.graph._hash_text(combined_content),
+                    entries=build_connection_entries(
+                        [node_a.id, node_b.id],
+                        relation_type=RelationType.DERIVED_FROM,
+                        role="source",
+                        weight=similarity,
+                        source="agent-consolidator",
+                    ),
+                ),
             },
+        )
+        summary_node.metadata["connection_index"] = build_summary_connection_index(
+            summary_id=summary_node.id,
+            summary_kind="pair_merge",
+            source="agent-consolidator",
+            content_hash=self.graph._hash_text(combined_content),
+            entries=summary_node.metadata["connection_index"]["entries"],
         )
         summary_node.set_embedding(avg_emb)
 
@@ -470,6 +523,7 @@ class Consolidator:
           4. Archive the absorbed node so the consolidator won't revisit it.
         """
         other_emb = np.array(other.embedding, dtype=np.float32)
+        summary.metadata = summary.metadata or {}
         new_emb = (summary_emb + other_emb) / 2.0
         norm = np.linalg.norm(new_emb)
         if norm > 0:
@@ -495,6 +549,21 @@ class Consolidator:
             merged_from.append(other.id)
         summary.metadata["merged_from"] = merged_from
         summary.metadata["last_absorbed_at"] = time.time()
+        summary.metadata["connection_index"] = merge_summary_connection_index(
+            summary.metadata,
+            summary_id=summary.id,
+            summary_kind=str(summary.metadata.get("summary_kind") or "absorbed_summary"),
+            source=summary.source or "agent-consolidator",
+            content_hash=self.graph._hash_text(summary.content),
+            entries=build_connection_entries(
+                [other.id],
+                relation_type=RelationType.DERIVED_FROM,
+                role="absorbed",
+                weight=similarity,
+                source="agent-consolidator",
+            ),
+        )
+        summary.parent_node_ids = sorted(set(summary.parent_node_ids) | {other.id})
 
         # Persist updated summary
         await self.graph._storage.upsert_node(summary)
@@ -523,6 +592,239 @@ class Consolidator:
                 set(other.metadata.get("lineage_summary_ids", [])) | {summary.id}
             )
         await self.graph.update_node(other)
+
+    # ------------------------------------------------------------------ #
+    # Phase 1b: Synthesize                                                 #
+    # ------------------------------------------------------------------ #
+
+    async def _synthesize_zone(self, result: ConsolidationResult) -> None:
+        """
+        Find clusters of nodes in the synthesis band and create SUMMARY nodes
+        that capture their shared meaning — WITHOUT archiving the originals.
+
+        Synthesis band:
+            synthesis_similarity_lower  <=  sim  <  consolidation_similarity_threshold
+
+        This is the primary self-evolution mechanism:
+        - Deduplication (Phase 1) collapses near-duplicates into one node
+        - Synthesis (this phase) builds HIGHER-LEVEL ABSTRACTIONS from related
+          but distinct nodes — connecting ideas that belong together but say
+          different things
+
+        Each synthesis summary:
+        - Has node_type=SUMMARY, source="agent-synthesizer"
+        - Lives at tier=SEMANTIC
+        - Is linked to its source nodes via SUMMARIZES edges
+        - Has a stable cluster_key so re-running the same cycle updates the
+          existing summary rather than creating a new one
+        - Originals are left completely intact (only their importance gets a
+          small boost to reflect that they've been synthesized)
+        """
+        lower = self.config.synthesis_similarity_lower
+        upper = self.config.consolidation_similarity_threshold
+
+        candidates = await self._sample_candidates()
+        embedded = [
+            (n, np.array(n.embedding, dtype=np.float32))
+            for n in candidates
+            if n.embedding is not None
+            # Synthesis never archives originals, so pinned nodes are fine here.
+            # Only exclude existing SUMMARY nodes (their embeddings are centroids,
+            # not raw content, and would create circular synthesis).
+            and n.node_type != NodeType.SUMMARY
+        ]
+        if len(embedded) < 2:
+            return
+
+        # ── Build adjacency for synthesis band ──────────────────────────
+        adj: dict[str, set[str]] = defaultdict(set)
+        sim_map: dict[str, float] = {}
+
+        for i in range(len(embedded)):
+            node_a, emb_a = embedded[i]
+            for j in range(i + 1, len(embedded)):
+                node_b, emb_b = embedded[j]
+                sim = float(np.clip(np.dot(emb_a, emb_b), -1.0, 1.0))
+                if lower <= sim < upper:
+                    adj[node_a.id].add(node_b.id)
+                    adj[node_b.id].add(node_a.id)
+                    pair_key = min(node_a.id, node_b.id) + max(node_a.id, node_b.id)
+                    sim_map[pair_key] = max(sim_map.get(pair_key, 0.0), sim)
+
+        if not adj:
+            return
+
+        # ── Cluster connected nodes ──────────────────────────────────────
+        id_to_item = {n.id: (n, emb) for n, emb in embedded}
+        clusters = self._find_clusters(embedded, adj)
+
+        # ── Cap at batch limit (most important clusters first) ───────────
+        clusters.sort(
+            key=lambda c: sum(n.importance for n, _ in c) / len(c),
+            reverse=True,
+        )
+        clusters = clusters[: self.config.max_synthesis_batch]
+
+        for cluster in clusters:
+            nodes = [n for n, _ in cluster]
+            avg_sim = float(np.mean([
+                sim_map.get(min(n.id, m.id) + max(n.id, m.id), lower)
+                for i, n in enumerate(nodes)
+                for m in nodes[i + 1:]
+            ] or [lower]))
+
+            await self._upsert_synthesis_summary(nodes, avg_sim, result)
+
+    async def _upsert_synthesis_summary(
+        self,
+        nodes: list,
+        avg_sim: float,
+        result: ConsolidationResult,
+    ) -> None:
+        """
+        Create or update a synthesis SUMMARY node for a cluster.
+        Originals are kept intact — only a new abstraction node is added.
+        """
+        import hashlib as _hashlib
+
+        # Stable key based on sorted node IDs so the same cluster always
+        # updates the same summary node instead of creating duplicates.
+        cluster_key = _hashlib.md5(
+            ",".join(sorted(n.id for n in nodes)).encode()
+        ).hexdigest()
+
+        # Check if a synthesis summary for this exact cluster already exists
+        existing_summaries = await self.graph.list_nodes(
+            node_type="summary", limit=10000
+        )
+        existing = next(
+            (
+                s for s in existing_summaries
+                if (s.metadata or {}).get("synthesis_cluster_key") == cluster_key
+                and s.source == "agent-synthesizer"
+            ),
+            None,
+        )
+
+        # Build content via LLM synthesis or structured fallback
+        content = await self._build_summary_content(nodes)
+        if not content.strip():
+            return
+
+        # Centroid embedding of the cluster
+        embs = [np.array(n.embedding, dtype=np.float32) for n in nodes if n.embedding]
+        avg_emb = np.mean(embs, axis=0).astype(np.float32) if embs else None
+        if avg_emb is not None:
+            norm = np.linalg.norm(avg_emb)
+            if norm > 0:
+                avg_emb = avg_emb / norm
+
+        combined_importance = min(0.9, max(n.importance for n in nodes) + 0.05)
+        metadata = {
+            "synthesis_cluster_key": cluster_key,
+            "source_node_ids": [n.id for n in nodes],
+            "cluster_size": len(nodes),
+            "avg_similarity": avg_sim,
+            "synthesized_at": time.time(),
+            "llm_synthesized": self._synthesize_fn is not None,
+            "connection_index": build_summary_connection_index(
+                summary_id=None,
+                summary_kind="synthesis",
+                source="agent-synthesizer",
+                content_hash=self.graph._hash_text(content),
+                entries=build_connection_entries(
+                    [n.id for n in nodes],
+                    relation_type=RelationType.SUMMARIZES,
+                    role="source",
+                    weight=max(0.5, avg_sim),
+                    source="agent-synthesizer",
+                ),
+            ),
+        }
+
+        if existing is None:
+            summary_node = MemoryNode(
+                collection=self.graph.collection,
+                content=content,
+                node_type=NodeType.SUMMARY,
+                tier=MemoryTier.SEMANTIC,
+                importance=combined_importance,
+                source="agent-synthesizer",
+                parent_node_ids=[n.id for n in nodes],
+                tags=["synthesis", "abstraction"],
+                metadata=metadata,
+            )
+            summary_node.metadata["connection_index"] = build_summary_connection_index(
+                summary_id=summary_node.id,
+                summary_kind="synthesis",
+                source="agent-synthesizer",
+                content_hash=self.graph._hash_text(content),
+                entries=summary_node.metadata["connection_index"]["entries"],
+            )
+            if avg_emb is not None:
+                summary_node.set_embedding(avg_emb)
+            await self.graph._storage.upsert_node(summary_node)
+            if avg_emb is not None:
+                await self.graph._vector_store.upsert(
+                    collection=self.graph.collection,
+                    node_id=summary_node.id,
+                    embedding=avg_emb,
+                    content=summary_node.content,
+                )
+            summary_id = summary_node.id
+            result.new_clusters.append(summary_id)
+            result.synthesized_summaries.append(summary_id)
+        else:
+            existing.content = content
+            existing.importance = combined_importance
+            existing.metadata.update(metadata)
+            existing.metadata["connection_index"] = build_summary_connection_index(
+                summary_id=existing.id,
+                summary_kind="synthesis",
+                source="agent-synthesizer",
+                content_hash=self.graph._hash_text(content),
+                entries=existing.metadata["connection_index"]["entries"],
+            )
+            existing.parent_node_ids = sorted(set(existing.parent_node_ids) | {n.id for n in nodes})
+            if avg_emb is not None:
+                existing.set_embedding(avg_emb)
+                await self.graph._vector_store.upsert(
+                    collection=self.graph.collection,
+                    node_id=existing.id,
+                    embedding=avg_emb,
+                    content=content,
+                )
+            await self.graph.update_node(existing)
+            summary_id = existing.id
+            result.synthesized_summaries.append(summary_id)
+
+        # SUMMARIZES edges: summary → each source node
+        # Remove stale edges first, then re-add
+        for edge in await self.graph.get_edges(summary_id, direction="out"):
+            if edge.relation_type == RelationType.SUMMARIZES:
+                await self.graph.delete_edge(edge.id)
+        for i, node in enumerate(nodes):
+            await self.graph.add_edge(
+                summary_id, node.id,
+                relation_type=RelationType.SUMMARIZES,
+                weight=max(0.5, avg_sim - i * 0.02),
+                confidence=avg_sim,
+                created_by="agent",
+                metadata={"synthesis_rank": i + 1},
+            )
+            # Slightly boost originals — being synthesized signals importance
+            if node.importance < 0.9:
+                node.importance = min(0.9, node.importance + 0.02)
+                await self.graph.update_node(node)
+
+        ids = [n.id[:8] for n in nodes]
+        action = "Updated" if existing else "Created"
+        result.thoughts.append(
+            f"{action} synthesis summary {summary_id[:8]} from {len(nodes)} nodes "
+            f"(avg_sim={avg_sim:.3f}, zone=[{self.config.synthesis_similarity_lower:.2f}, "
+            f"{self.config.consolidation_similarity_threshold:.2f})). "
+            f"Members: {', '.join(ids)}"
+        )
 
     async def _prune_exact_duplicates(self, result: ConsolidationResult) -> None:
         nodes = await self.graph.list_nodes(limit=5000)

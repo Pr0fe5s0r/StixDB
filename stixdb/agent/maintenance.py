@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Iterable
 
 from stixdb.graph.node import MemoryNode, NodeType, MemoryTier
+from stixdb.graph.summary_index import extract_summary_related_node_ids
 
 _STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "been", "by", "for", "from",
@@ -58,7 +59,7 @@ class MaintenancePlanner:
     structure and coverage gaps.
     """
 
-    def __init__(self, max_questions: int = 6) -> None:
+    def __init__(self, max_questions: int = 8) -> None:
         self.max_questions = max_questions
 
     def plan(
@@ -87,6 +88,9 @@ class MaintenancePlanner:
         candidates.extend(self._build_tag_questions(active_nodes, covered_node_ids))
         candidates.extend(self._build_keyword_gap_questions(active_nodes, covered_node_ids))
         candidates.extend(self._build_relationship_questions(collection, active_nodes))
+        # Higher-quality question generation grounded in actual content
+        candidates.extend(self._build_content_entity_questions(active_nodes, covered_node_ids))
+        candidates.extend(self._build_user_query_derived_questions(nodes, covered_node_ids))
 
         deduped: dict[str, MaintenanceQuestion] = {}
         for candidate in candidates:
@@ -338,10 +342,196 @@ class MaintenancePlanner:
             )
         ]
 
+    # ── Content-entity questions ──────────────────────────────────────────── #
+
+    def _build_content_entity_questions(
+        self,
+        nodes: list[MemoryNode],
+        covered_node_ids: set[str],
+    ) -> list[MaintenanceQuestion]:
+        """
+        Mine ingested chunks for specific identifiers (class/function names,
+        config keys, CLI flags) and generate targeted questions about them.
+        These are far more useful than generic "summarize X" questions because
+        they produce specific, actionable answers.
+        """
+        import re as _re
+
+        # Patterns to extract meaningful identifiers from code/prose content
+        _class_pat  = _re.compile(r"\bclass\s+([A-Z][A-Za-z0-9_]{2,})")
+        _func_pat   = _re.compile(r"\bdef\s+([a-z_][a-z0-9_]{3,})\s*\(")
+        _config_pat = _re.compile(r"\b(config|cfg|settings)\.[a-z_][a-z0-9_.]{3,}\b")
+        _flag_pat   = _re.compile(r"--([a-z][a-z0-9-]{3,})\b")
+
+        # Only look at uncovered ingested chunks (not internal agent nodes)
+        candidate_nodes = [
+            n for n in nodes
+            if n.id not in covered_node_ids
+            and n.source not in _GENERIC_SOURCE_NAMES
+            and n.node_type != NodeType.SUMMARY
+        ]
+
+        # Collect entity → supporting nodes
+        entity_nodes: dict[str, list[MemoryNode]] = {}
+        for node in candidate_nodes:
+            text = node.content or ""
+            for pat, kind in (
+                (_class_pat, "class"),
+                (_func_pat, "function"),
+                (_config_pat, "config"),
+                (_flag_pat, "flag"),
+            ):
+                for match in pat.findall(text):
+                    key = f"{kind}:{match.split('.')[-1]}"
+                    if key not in entity_nodes:
+                        entity_nodes[key] = []
+                    entity_nodes[key].append(node)
+
+        # Pick entities mentioned in multiple chunks — they're central concepts
+        multi = {
+            k: v for k, v in entity_nodes.items() if len(v) >= 2
+        }
+        if not multi:
+            return []
+
+        # Rank by occurrence count, pick top 3
+        ranked = sorted(multi.items(), key=lambda kv: len(kv[1]), reverse=True)[:3]
+
+        questions: list[MaintenanceQuestion] = []
+        for key, source_nodes in ranked:
+            kind, name = key.split(":", 1)
+            focus = self._top_nodes(source_nodes, limit=6)
+
+            if kind == "class":
+                question = (
+                    f"What does the {name} class do, what are its main methods, "
+                    f"and how is it used in this codebase?"
+                )
+                label = f"Entity Summary: {name} (class)"
+            elif kind == "function":
+                question = (
+                    f"What does the {name}() function do, what are its inputs and "
+                    f"outputs, and where is it called from?"
+                )
+                label = f"Entity Summary: {name}() function"
+            elif kind == "config":
+                question = (
+                    f"What is the {name} configuration setting, what values does it "
+                    f"accept, and what behaviour does it control?"
+                )
+                label = f"Config Summary: {name}"
+            else:  # flag
+                question = (
+                    f"What does the --{name} flag do, when should it be used, "
+                    f"and what are its valid values?"
+                )
+                label = f"Flag Summary: --{name}"
+
+            questions.append(
+                MaintenanceQuestion(
+                    question=question,
+                    summary_label=label,
+                    kind="entity_summary",
+                    reason=(
+                        f"'{name}' ({kind}) appears in {len(source_nodes)} source chunks "
+                        f"and has not been summarised yet."
+                    ),
+                    # Higher than generic source-summary questions (0.7-0.95) so
+                    # specific entity questions actually make it into the rotation.
+                    priority=0.92 + min(0.18, len(source_nodes) * 0.02),
+                    focus_node_ids=[n.id for n in focus],
+                    focus_terms=[name],
+                )
+            )
+
+        return questions
+
+    def _build_user_query_derived_questions(
+        self,
+        nodes: list[MemoryNode],
+        covered_node_ids: set[str],
+    ) -> list[MaintenanceQuestion]:
+        """
+        Extract past user questions from stored answer/reasoning nodes and
+        generate derivative follow-up questions from them.
+
+        Past questions live in node.metadata["question"] on nodes with
+        source="agent-reasoning" or source="agent-maintenance" (kind=workflow).
+        """
+        import re as _re
+
+        past_questions: list[tuple[str, MemoryNode]] = []
+        seen_questions: set[str] = set()
+
+        for node in nodes:
+            q = (node.metadata or {}).get("question", "")
+            if not q or len(q) < 10:
+                continue
+            q_lower = q.strip().lower()
+            # Skip maintenance/generated questions — only real user queries
+            if any(phrase in q_lower for phrase in (
+                "summarize", "summarise", "main ideas", "main claims",
+                "what is currently known", "how are related",
+            )):
+                continue
+            if q_lower in seen_questions:
+                continue
+            seen_questions.add(q_lower)
+            past_questions.append((q.strip(), node))
+
+        if not past_questions:
+            return []
+
+        questions: list[MaintenanceQuestion] = []
+
+        for original_q, ref_node in past_questions[:4]:
+            # Derive a "why/how" follow-up from the original question
+            words = original_q.rstrip("?").strip()
+            deriv = self._derive_followup(words)
+            if not deriv:
+                continue
+
+            focus = self._top_nodes([ref_node], limit=6)
+            questions.append(
+                MaintenanceQuestion(
+                    question=deriv,
+                    summary_label=f"Follow-up: {words[:60]}",
+                    kind="user_query_followup",
+                    reason=(
+                        f"Derived from past user question: \"{words[:80]}\". "
+                        "Proactively filling in related context improves future retrieval."
+                    ),
+                    priority=0.85 + min(0.2, ref_node.importance * 0.2),
+                    focus_node_ids=[n.id for n in focus],
+                    focus_terms=self._top_terms_from_nodes(focus, limit=3),
+                )
+            )
+
+        return questions
+
+    def _derive_followup(self, question: str) -> str:
+        """
+        Produce a concrete follow-up question from a user question.
+        Strategy: append "how" / "why" / "configuration" angle.
+        """
+        q = question.lower().strip()
+        if q.startswith(("what ", "which ")):
+            return f"How is {question[question.index(' ')+1:].rstrip('?')} configured and what are the available options?"
+        if q.startswith("how "):
+            return f"What are the exact steps and code needed to {question[4:].rstrip('?')}?"
+        if q.startswith(("where ", "when ")):
+            return f"Why does {question[question.index(' ')+1:].rstrip('?')} work this way, and are there edge cases to know about?"
+        # Generic: "tell me more" style
+        if len(question) > 20:
+            return f"What are the implementation details and configuration options for: {question.rstrip('?')}?"
+        return ""
+
     def _covered_node_ids(self, maintenance_nodes: Iterable[MemoryNode]) -> set[str]:
         covered: set[str] = set()
         for node in maintenance_nodes:
-            for item in (node.metadata or {}).get("synthesized_from", []):
+            metadata = node.metadata or {}
+            covered.update(extract_summary_related_node_ids(metadata))
+            for item in metadata.get("synthesized_from", []):
                 covered.add(str(item))
         return covered
 

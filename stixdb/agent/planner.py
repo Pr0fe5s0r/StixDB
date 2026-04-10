@@ -103,8 +103,20 @@ class AccessPlanner:
         hot_threshold = 0.65
         archive_threshold = 0.08
 
+        # Internal sources that should never enter working memory — they are
+        # bookkeeping artifacts, not user-relevant memory.
+        _internal_sources = {"agent-maintenance", "agent-consolidator", "agent-reflection"}
+
         for node in all_nodes:
             if node.pinned:
+                continue
+            # Maintenance/consolidator summary nodes must stay at SEMANTIC tier.
+            # They get accessed on every maintenance cycle which inflates their
+            # access scores, causing them to displace genuinely relevant nodes.
+            if node.source in _internal_sources:
+                # Demote if they somehow ended up in working memory
+                if node.tier == MemoryTier.WORKING:
+                    demote.append(node)
                 continue
 
             score = self.get_score(node.id)

@@ -15,13 +15,12 @@ constructs a reasoning prompt that forces the LLM to:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
 from dataclasses import dataclass
 from typing import Optional, Any, AsyncIterator
-
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 from stixdb.graph.node import MemoryNode
 from stixdb.config import LLMProvider, ReasonerConfig
@@ -76,20 +75,29 @@ available to you for this turn.
 
 RULES:
 1. Base your answer ONLY on the supporting source excerpts for this turn — do not hallucinate.
-2. Speak as if you are using your own memory. Do NOT frame the answer as something "the collection says", "the database says", or "the memory says".
-3. Do NOT mention internal implementation terms such as "memory nodes", "chunks", "retrieval", "database", "collection", or "context window".
-4. If you need to refer to where information came from, say "the source", "the source text", or the source name if one is provided.
-5. Prefer natural first-person language such as "I know", "I found", or "From the source text" when it fits.
-6. Always cite which source IDs support your answer.
-7. If the information is insufficient, say so explicitly.
-8. Speak naturally to the user. Never say things like "the provided memory nodes say", "the collection tells me", or "the current memory does not contain".
-9. Produce a structured JSON response with keys:
-   - "reasoning": step-by-step explanation of how you derived the answer, using source-facing language
-   - "answer": final concise answer (leave blank if more info is needed)
+2. Be SPECIFIC and GROUNDED: use exact class names, function names, configuration keys, file paths,
+   parameter values, and code identifiers that appear in the source excerpts.
+   A good answer says "KuzuBackend (stixdb/storage/kuzu_backend.py), NetworkXBackend (fallback),
+   Neo4jBackend" — not "three storage options". Quote identifiers directly.
+3. Do NOT produce vague paraphrases — the user needs to act on this answer.
+   If the sources name a specific class, config key, or flag: name it in your answer.
+4. Speak as if you are using your own memory. Do NOT frame the answer as something "the collection says",
+   "the database says", or "the memory says".
+5. Do NOT mention internal implementation terms such as "memory nodes", "chunks", "retrieval",
+   "database", "collection", or "context window".
+6. If you need to refer to where information came from, say "the source", "the source text",
+   or the source name if one is provided.
+7. Always cite which source IDs support your answer.
+8. If the information is insufficient, say so explicitly rather than guessing.
+9. Speak naturally to the user.
+10. Produce a structured JSON response with keys:
+   - "reasoning": step-by-step explanation of how you derived the answer, naming specific identifiers
+   - "answer": complete, specific answer that names exact class names, config keys, paths, and values
+     from the sources — no vague paraphrases (leave blank if information is truly insufficient)
    - "used_node_ids": list of source IDs that were most relevant
    - "confidence": float 0-1 indicating your confidence in the answer
-   - "status": "complete" OR "incomplete" (set to "incomplete" if you need more information to give a high confidence answer)
-   - "next_query": (optional) if status is "incomplete", provide a search query to find the missing pieces
+   - "status": "complete" OR "incomplete" (set to "incomplete" if you need more information)
+   - "next_query": (optional) if status is "incomplete", provide a search query for the missing pieces
 """
 
 STREAM_SYSTEM_PROMPT = """\
@@ -99,9 +107,11 @@ available to you for this turn.
 
 RULES:
 1. Base your answer ONLY on the supporting source excerpts for this turn — do not hallucinate.
-2. Stream the final answer immediately in plain natural language.
-3. Speak as if you are using your own memory. Do NOT say "the collection says", "the database says", or similar.
-4. If the information is insufficient, say so plainly instead of inventing details.
+2. Be SPECIFIC: name exact class names, function names, config keys, file paths, and parameter values
+   from the source excerpts. Never paraphrase when you can quote identifiers directly.
+3. Stream the final answer immediately in plain natural language.
+4. Speak as if you are using your own memory. Do NOT say "the collection says", "the database says", or similar.
+5. If the information is insufficient, say so plainly instead of inventing details.
 """
 
 HOP_PLAN_SYSTEM_PROMPT = """\
@@ -375,7 +385,6 @@ class Reasoner:
 
         return self._parse_hop_plan(raw, current_query=current_query, fallback_question=question)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     async def reason(
         self,
         collection: str,
@@ -386,6 +395,9 @@ class Reasoner:
         output_schema: Optional[dict] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        timeout_seconds: Optional[float] = None,
+        max_attempts: int = 3,
+        fast_mode: bool = False,
     ) -> ReasoningResult:
         """
         Core reasoning entry point.
@@ -404,57 +416,93 @@ class Reasoner:
                 latency_ms=0.0,
             )
 
+        attempts = 1 if fast_mode else max(1, max_attempts)
+        last_error: Optional[Exception] = None
+        for attempt in range(attempts):
+            try:
+                raw = await self._reason_once(
+                    question=question,
+                    nodes=nodes,
+                    history=history,
+                    system_prompt=system_prompt,
+                    output_schema=output_schema,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout_seconds=timeout_seconds,
+                )
+                latency_ms = (time.time() - start) * 1000.0
+                result = self._parse_response(raw, nodes, latency_ms)
+                self._tracer.record_reasoning(
+                    collection=collection,
+                    question=question,
+                    reasoning_trace=result.reasoning_trace,
+                )
+                return result
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(min(2 ** attempt, 3))
+
+        assert last_error is not None
+        raise last_error
+
+    async def _reason_once(
+        self,
+        *,
+        question: str,
+        nodes: list[MemoryNode],
+        history: Optional[list[dict]] = None,
+        system_prompt: Optional[str] = None,
+        output_schema: Optional[dict] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> str:
         provider = self.config.provider
         sp = get_system_prompt(system_prompt, output_schema)
         effective_temperature = self.config.temperature if temperature is None else temperature
         effective_max_tokens = self.config.max_tokens if max_tokens is None else max_tokens
+        effective_timeout = self.config.timeout_seconds if timeout_seconds is None else timeout_seconds
 
         if provider == LLMProvider.OPENAI:
-            raw = await self._call_openai(
+            return await self._call_openai(
                 question,
                 nodes,
                 sp,
                 history=history,
                 temperature=effective_temperature,
                 max_tokens=effective_max_tokens,
+                timeout_seconds=effective_timeout,
             )
-        elif provider == LLMProvider.ANTHROPIC:
-            raw = await self._call_anthropic(
+        if provider == LLMProvider.ANTHROPIC:
+            return await self._call_anthropic(
                 question,
                 nodes,
                 sp,
                 history=history,
                 max_tokens=effective_max_tokens,
+                timeout_seconds=effective_timeout,
             )
-        elif provider == LLMProvider.OLLAMA:
-            raw = await self._call_ollama(
+        if provider == LLMProvider.OLLAMA:
+            return await self._call_ollama(
                 question,
                 nodes,
                 sp,
                 history=history,
                 max_tokens=effective_max_tokens,
+                timeout_seconds=effective_timeout,
             )
-        elif provider == LLMProvider.CUSTOM:
-            raw = await self._call_custom(
+        if provider == LLMProvider.CUSTOM:
+            return await self._call_custom(
                 question,
                 nodes,
                 sp,
                 history=history,
                 temperature=effective_temperature,
                 max_tokens=effective_max_tokens,
+                timeout_seconds=effective_timeout,
             )
-        else:
-            raw = self._heuristic_fallback(question, nodes)
-
-        latency_ms = (time.time() - start) * 1000.0
-        result = self._parse_response(raw, nodes, latency_ms)
-
-        self._tracer.record_reasoning(
-            collection=collection,
-            question=question,
-            reasoning_trace=result.reasoning_trace,
-        )
-        return result
+        return self._heuristic_fallback(question, nodes)
 
     async def stream_reason(
         self,
@@ -551,6 +599,7 @@ class Reasoner:
         history: Optional[list[dict]] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        timeout_seconds: Optional[float] = None,
         user_prompt: Optional[str] = None,
     ) -> str:
         import openai
@@ -569,6 +618,7 @@ class Reasoner:
             messages=messages,
             temperature=self.config.temperature if temperature is None else temperature,
             max_tokens=self.config.max_tokens if max_tokens is None else max_tokens,
+            timeout_seconds=self.config.timeout_seconds if timeout_seconds is None else timeout_seconds,
         )
 
     async def _call_custom(
@@ -579,6 +629,7 @@ class Reasoner:
         history: Optional[list[dict]] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        timeout_seconds: Optional[float] = None,
         user_prompt: Optional[str] = None,
     ) -> str:
         import openai
@@ -597,6 +648,7 @@ class Reasoner:
             messages=messages,
             temperature=self.config.temperature if temperature is None else temperature,
             max_tokens=self.config.max_tokens if max_tokens is None else max_tokens,
+            timeout_seconds=self.config.timeout_seconds if timeout_seconds is None else timeout_seconds,
         )
 
     async def _call_chat_completion_with_fallback(
@@ -605,6 +657,7 @@ class Reasoner:
         messages: list[dict[str, str]],
         temperature: float,
         max_tokens: int,
+        timeout_seconds: float,
     ) -> str:
         response = await client.chat.completions.create(
             model=self.config.model,
@@ -612,7 +665,7 @@ class Reasoner:
             temperature=temperature,
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
-            timeout=self.config.timeout_seconds,
+            timeout=timeout_seconds,
         )
         content = _extract_chat_message_text(response).strip()
         if content:
@@ -636,7 +689,7 @@ class Reasoner:
             messages=fallback_messages,
             temperature=temperature,
             max_tokens=max_tokens,
-            timeout=self.config.timeout_seconds,
+            timeout=timeout_seconds,
         )
         retry_content = _extract_chat_message_text(retry_response).strip()
         return retry_content
@@ -648,6 +701,7 @@ class Reasoner:
         system_prompt: str,
         history: Optional[list[dict]] = None,
         max_tokens: Optional[int] = None,
+        timeout_seconds: Optional[float] = None,
         user_prompt: Optional[str] = None,
     ) -> str:
         import anthropic
@@ -662,6 +716,7 @@ class Reasoner:
             messages=[
                 {"role": "user", "content": user_prompt or build_context_prompt(question, nodes)}
             ],
+            timeout=self.config.timeout_seconds if timeout_seconds is None else timeout_seconds,
         )
         return response.content[0].text
 
@@ -672,6 +727,7 @@ class Reasoner:
         system_prompt: str,
         history: Optional[list[dict]] = None,
         max_tokens: Optional[int] = None,
+        timeout_seconds: Optional[float] = None,
         user_prompt: Optional[str] = None,
     ) -> str:
         import httpx
@@ -679,7 +735,7 @@ class Reasoner:
         prompt = user_prompt or build_context_prompt(question, nodes)
         full_prompt = f"{system_prompt}\n\n{prompt}"
 
-        async with httpx.AsyncClient(timeout=self.config.timeout_seconds) as client:
+        async with httpx.AsyncClient(timeout=self.config.timeout_seconds if timeout_seconds is None else timeout_seconds) as client:
             response = await client.post(
                 f"{self.config.ollama_base_url}/api/generate",
                 json={

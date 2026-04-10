@@ -63,7 +63,8 @@ with StixDBClient(base_url="http://localhost:4020") as client:
 
 ### Query & Search (`client.query` & `client.search`)
 - **`ask`**: Grounded answers using your private data.
-- **`retrieve`**: Find relative facts without using an LLM.
+- **`retrieve`**: Find relevant facts without using an LLM.
+- **`retrieve_vector_only`**: Explicit shortcut for the pure vector path (`depth=0`).
 - **`search`**: Advanced search across multiple collections.
 
 ### 🔌 OpenAI Compatibility

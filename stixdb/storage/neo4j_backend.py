@@ -221,6 +221,7 @@ class Neo4jBackend(StorageBackend):
         node_type: Optional[str] = None,
         limit: int = 1000,
         offset: int = 0,
+        include_embedding: bool = False,
     ) -> list[MemoryNode]:
         async with self._driver.session() as session:
             query = "MATCH (n:MemoryNode {collection: $collection})"

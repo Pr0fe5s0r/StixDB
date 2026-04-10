@@ -250,7 +250,16 @@ class KuzuBackend(StorageBackend):
                  A 'kuzu.db' file will be created within this directory.
     """
 
-    def __init__(self, db_path: str = "./stixdb_data/kuzu") -> None:
+    # KuzuDB default buffer_pool_size is ~80 % of system RAM, which causes
+    # the on-disk file to balloon to gigabytes even for tiny datasets.
+    # 256 MB is more than sufficient for normal StixDB workloads.
+    _DEFAULT_BUFFER_POOL_MB = 256
+
+    def __init__(
+        self,
+        db_path: str = "./stixdb_data/kuzu",
+        buffer_pool_mb: int = _DEFAULT_BUFFER_POOL_MB,
+    ) -> None:
         try:
             import kuzu  # type: ignore
         except ImportError:
@@ -264,34 +273,105 @@ class KuzuBackend(StorageBackend):
         os.makedirs(db_path, exist_ok=True)
         # Construct the full file path for the database
         db_file_path = os.path.join(db_path, "kuzu.db")
-        self._db = kuzu.Database(db_file_path)
+        self._db_file_path = db_file_path
+        self._db_dir = db_path
+        self._buffer_pool_mb = max(64, int(buffer_pool_mb))
+        pool_bytes = self._buffer_pool_mb * 1024 * 1024
+
+        # KuzuDB WAL replay can fail with "buffer pool full" after an unclean
+        # shutdown.  If the first open fails, remove the WAL and retry once —
+        # the committed data in kuzu.db survives without the WAL (only
+        # in-flight transactions are lost, which is acceptable on crash).
+        def _open_db():
+            return kuzu.Database(db_file_path, buffer_pool_size=pool_bytes)
+
+        try:
+            self._db = _open_db()
+        except RuntimeError as exc:
+            if self._is_buffer_manager_error(exc):
+                wal_path = db_file_path + ".wal"
+                if os.path.exists(wal_path):
+                    logger.warning(
+                        "KuzuDB open failed — removing WAL and retrying",
+                        error=str(exc)[:120],
+                        wal_path=wal_path,
+                    )
+                    os.remove(wal_path)
+                    self._db = _open_db()   # second attempt (raises if still broken)
+                else:
+                    raise
+            else:
+                raise
+
         self._conn = kuzu.Connection(self._db)
         self._lock = asyncio.Lock()
         self._initialized = False
         self._upsert_count = 0
-        logger.info("KuzuDB backend created", db_path=db_file_path)
+        logger.info(
+            "KuzuDB backend created",
+            db_path=db_file_path,
+            buffer_pool_mb=self._buffer_pool_mb,
+        )
 
     # ------------------------------------------------------------------ #
     # Internal helpers                                                     #
     # ------------------------------------------------------------------ #
 
-    def _exec(self, query: str, params: Optional[dict] = None):
-        """Execute a query synchronously, returning results as list[dict]."""
-        if params:
-            result = self._conn.execute(query, params)
-        else:
-            result = self._conn.execute(query)
-        rows: list[dict] = []
-        if result is None:
-            return rows
+    def _has_recoverable_wal(self) -> bool:
+        return os.path.exists(self._db_file_path + ".wal")
+
+    def _is_buffer_manager_error(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "buffer manager exception" in message or "buffer pool is full" in message
+
+    def _reopen_connection(self, drop_wal: bool = False) -> None:
+        wal_path = self._db_file_path + ".wal"
         try:
-            col_names = result.get_column_names()
-            while result.has_next():
-                raw = result.get_next()
-                rows.append(dict(zip(col_names, raw)))
+            self._conn.close()
         except Exception:
             pass
-        return rows
+        try:
+            self._db.close()
+        except Exception:
+            pass
+        if drop_wal and os.path.exists(wal_path):
+            os.remove(wal_path)
+        import kuzu  # type: ignore
+        pool_bytes = self._buffer_pool_mb * 1024 * 1024
+        self._db = kuzu.Database(self._db_file_path, buffer_pool_size=pool_bytes)
+        self._conn = kuzu.Connection(self._db)
+
+    def _exec(self, query: str, params: Optional[dict] = None, *, _allow_recovery: bool = True):
+        """Execute a query synchronously, returning results as list[dict]."""
+        try:
+            if params:
+                result = self._conn.execute(query, params)
+            else:
+                result = self._conn.execute(query)
+            rows: list[dict] = []
+            if result is None:
+                return rows
+            try:
+                col_names = result.get_column_names()
+                while result.has_next():
+                    raw = result.get_next()
+                    rows.append(dict(zip(col_names, raw)))
+            except Exception:
+                pass
+            finally:
+                # Explicitly clear result to free pinned pages in the buffer pool.
+                del result
+            return rows
+        except RuntimeError as exc:
+            if _allow_recovery and self._is_buffer_manager_error(exc) and self._has_recoverable_wal():
+                logger.warning(
+                    "Kuzu query failed with buffer manager error; retrying after WAL reset",
+                    error=str(exc)[:200],
+                    wal_path=self._db_file_path + ".wal",
+                )
+                self._reopen_connection(drop_wal=True)
+                return self._exec(query, params, _allow_recovery=False)
+            raise
 
     def _ensure_schema(self) -> None:
         if self._initialized:
@@ -429,6 +509,29 @@ class KuzuBackend(StorageBackend):
             return None
         return _row_to_node(_prefix_strip(rows[0]))
 
+    async def get_nodes(self, node_ids: list[str], collection: str) -> list[MemoryNode]:
+        if not node_ids:
+            return []
+
+        projection = _node_return_projection(include_embedding=False)
+        async with self._lock:
+            self._ensure_schema()
+            rows = self._exec(
+                f"""
+                UNWIND $ids AS node_id
+                MATCH (n:MemoryNode {{id: node_id, collection: $col}})
+                RETURN {projection}
+                """,
+                {"ids": node_ids, "col": collection},
+            )
+
+        node_map = {}
+        for row in rows:
+            node = _row_to_node(_prefix_strip(row))
+            node_map[node.id] = node
+
+        return [node_map[node_id] for node_id in node_ids if node_id in node_map]
+
     async def delete_node(self, node_id: str, collection: str) -> bool:
         async with self._lock:
             self._ensure_schema()
@@ -460,6 +563,7 @@ class KuzuBackend(StorageBackend):
         node_type: Optional[str] = None,
         limit: int = 1000,
         offset: int = 0,
+        include_embedding: bool = False,
     ) -> list[MemoryNode]:
         conditions = ["n.collection = $col"]
         params: dict = {"col": collection}
@@ -470,13 +574,14 @@ class KuzuBackend(StorageBackend):
             conditions.append("n.node_type = $node_type")
             params["node_type"] = node_type
         where = " AND ".join(conditions)
+        projection = _node_return_projection(include_embedding=include_embedding)
         async with self._lock:
             self._ensure_schema()
             rows = self._exec(
-                f"MATCH (n:MemoryNode) WHERE {where} RETURN n.* SKIP {offset} LIMIT {limit}",
+                f"MATCH (n:MemoryNode) WHERE {where} RETURN {projection} SKIP {offset} LIMIT {limit}",
                 params,
             )
-        return [_row_to_node(_prefix_strip(r)) for r in rows]
+        return [_row_to_node(r) for r in rows]
 
     async def count_nodes(self, collection: str) -> int:
         async with self._lock:
@@ -562,22 +667,30 @@ class KuzuBackend(StorageBackend):
             return []
         async with self._lock:
             self._ensure_schema()
-            depth_str = f"1..{max_depth}"
-            if direction == "out":
-                pattern = f"(start:MemoryNode {{id: $nid}})-[r:RelationEdge*{depth_str}]->(nbr:MemoryNode)"
-            elif direction == "in":
-                pattern = f"(start:MemoryNode {{id: $nid}})<-[r:RelationEdge*{depth_str}]-(nbr:MemoryNode)"
-            else:
-                pattern = f"(start:MemoryNode {{id: $nid}})-[r:RelationEdge*{depth_str}]-(nbr:MemoryNode)"
+            projection = _node_return_projection(include_embedding=False).replace("n.", "nbr.")
+            if max_depth == 1:
+                if relation_types:
+                    return await self._get_neighbours_filtered(node_id, collection, direction, relation_types)
 
-            query = f"MATCH {pattern} WHERE nbr.collection = $col AND nbr.id <> $nid RETURN DISTINCT nbr.*"
+                if direction == "out":
+                    pattern = "(start:MemoryNode {id: $nid})-[r:RelationEdge]->(nbr:MemoryNode)"
+                elif direction == "in":
+                    pattern = "(start:MemoryNode {id: $nid})<-[r:RelationEdge]-(nbr:MemoryNode)"
+                else:
+                    pattern = "(start:MemoryNode {id: $nid})-[r:RelationEdge]-(nbr:MemoryNode)"
+                query = f"MATCH {pattern} WHERE nbr.collection = $col AND nbr.id <> $nid RETURN DISTINCT {projection}"
+            else:
+                depth_str = f"1..{max_depth}"
+                if direction == "out":
+                    pattern = f"(start:MemoryNode {{id: $nid}})-[r:RelationEdge*{depth_str}]->(nbr:MemoryNode)"
+                elif direction == "in":
+                    pattern = f"(start:MemoryNode {{id: $nid}})<-[r:RelationEdge*{depth_str}]-(nbr:MemoryNode)"
+                else:
+                    pattern = f"(start:MemoryNode {{id: $nid}})-[r:RelationEdge*{depth_str}]-(nbr:MemoryNode)"
+                query = f"MATCH {pattern} WHERE nbr.collection = $col AND nbr.id <> $nid RETURN DISTINCT {projection}"
+
             rows = self._exec(query, {"nid": node_id, "col": collection})
         nodes = [_row_to_node(_prefix_strip(r)) for r in rows]
-        if relation_types:
-            # Post-filter: Kuzu variable-length paths expose edge props differently
-            # so we do a separate check for single-hop when type filtering is needed
-            if max_depth == 1:
-                return await self._get_neighbours_filtered(node_id, collection, direction, relation_types)
         return nodes
 
     async def _get_neighbours_filtered(
@@ -599,7 +712,7 @@ class KuzuBackend(StorageBackend):
         query = (
             f"MATCH {pattern} "
             f"WHERE r.relation_type IN [{rt_list}] AND nbr.collection = $col "
-            f"RETURN DISTINCT nbr.*"
+            f"RETURN DISTINCT {_node_return_projection(include_embedding=False).replace('n.', 'nbr.')}"
         )
         rows = self._exec(query, {"nid": node_id, "col": collection})
         return [_row_to_node(_prefix_strip(r)) for r in rows]
@@ -715,6 +828,147 @@ class KuzuBackend(StorageBackend):
             )
         return True
 
+    # ------------------------------------------------------------------ #
+    # Storage compaction                                                    #
+    # ------------------------------------------------------------------ #
+
+    async def compact(self) -> dict:
+        """
+        Reclaim wasted disk space by rebuilding the database from scratch.
+
+        KuzuDB pre-allocates buffer-pool-sized pages on disk on first use.
+        A fresh database file created with a controlled buffer_pool_size
+        uses dramatically less disk space for the same logical data.
+
+        Process:
+          1. Read ALL nodes, edges and clusters into memory.
+          2. Close + delete the on-disk database files.
+          3. Re-create the database with the same buffer_pool_size cap.
+          4. Reimport all data.
+
+        Returns a summary dict with node/edge/cluster counts and size delta.
+        """
+        import shutil
+
+        async with self._lock:
+            self._ensure_schema()
+
+            # ── 1. Read everything into memory ──────────────────────────
+            node_rows = self._exec("MATCH (n:MemoryNode) RETURN n.*")
+            edge_rows = self._exec(
+                "MATCH (a:MemoryNode)-[r:RelationEdge]->(b:MemoryNode) "
+                "RETURN a.id AS src_id, b.id AS dst_id, r.*"
+            )
+            cluster_rows = self._exec("MATCH (cl:MemoryCluster) RETURN cl.*")
+
+            old_size = os.path.getsize(self._db_file_path) if os.path.exists(self._db_file_path) else 0
+
+            # ── 2. Tear down the old database ────────────────────────────
+            # Close the connection and database handle
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            try:
+                self._db.close()
+            except Exception:
+                pass
+
+            for fname in ("kuzu.db", "kuzu.db.wal", "kuzu.db.shadow"):
+                fpath = os.path.join(self._db_dir, fname)
+                if os.path.exists(fpath):
+                    os.remove(fpath)
+
+            # ── 3. Re-create with the same controlled pool size ──────────
+            import kuzu  # type: ignore
+            pool_bytes = self._buffer_pool_mb * 1024 * 1024
+            self._db = kuzu.Database(self._db_file_path, buffer_pool_size=pool_bytes)
+            self._conn = kuzu.Connection(self._db)
+            self._initialized = False
+            self._ensure_schema()
+
+            # ── 4. Reimport ──────────────────────────────────────────────
+            # Nodes first (edges reference them)
+            for row in node_rows:
+                # Rename wildcard columns from MATCH n.* to bare field names
+                clean = {k.split(".")[-1]: v for k, v in row.items()}
+                self._exec(
+                    """
+                    MERGE (n:MemoryNode {id: $id})
+                    SET n.collection=$collection, n.content=$content,
+                        n.node_type=$node_type, n.tier=$tier,
+                        n.importance=$importance, n.source=$source,
+                        n.source_agent_id=$source_agent_id,
+                        n.tags=$tags, n.metadata=$metadata,
+                        n.embedding=$embedding,
+                        n.parent_node_ids=$parent_node_ids,
+                        n.pinned=$pinned,
+                        n.created_at=$created_at, n.updated_at=$updated_at,
+                        n.last_accessed=$last_accessed,
+                        n.access_count=$access_count
+                    """,
+                    clean,
+                )
+
+            # Edges
+            for row in edge_rows:
+                src_id = row.pop("src_id", row.pop("a.id", None))
+                dst_id = row.pop("dst_id", row.pop("b.id", None))
+                clean = {k.split(".")[-1]: v for k, v in row.items()}
+                if src_id and dst_id:
+                    self._exec(
+                        """
+                        MATCH (a:MemoryNode {id: $src}), (b:MemoryNode {id: $dst})
+                        MERGE (a)-[r:RelationEdge {id: $id}]->(b)
+                        SET r.collection=$collection,
+                            r.relation_type=$relation_type,
+                            r.weight=$weight, r.confidence=$confidence,
+                            r.created_by=$created_by,
+                            r.metadata=$metadata, r.created_at=$created_at
+                        """,
+                        {**clean, "src": src_id, "dst": dst_id},
+                    )
+
+            # Clusters — use only columns that exist in the exported row
+            _cluster_fields = {
+                "collection", "label", "cluster_type", "member_ids",
+                "summary", "tags", "metadata", "created_at", "updated_at",
+            }
+            for row in cluster_rows:
+                clean = {k.split(".")[-1]: v for k, v in row.items()}
+                # Build SET clause from available fields only
+                present = {k: v for k, v in clean.items() if k in _cluster_fields}
+                if not present:
+                    continue
+                set_parts = ", ".join(f"cl.{k}=${k}" for k in present)
+                try:
+                    self._exec(
+                        f"MERGE (cl:MemoryCluster {{id: $id}}) SET {set_parts}",
+                        {"id": clean["id"], **present},
+                    )
+                except Exception:
+                    pass  # skip individual cluster failures
+
+        new_size = os.path.getsize(self._db_file_path) if os.path.exists(self._db_file_path) else 0
+        saved_mb = (old_size - new_size) / (1024 * 1024)
+        logger.info(
+            "KuzuDB compacted",
+            nodes=len(node_rows),
+            edges=len(edge_rows),
+            clusters=len(cluster_rows),
+            old_size_mb=round(old_size / 1024**2, 1),
+            new_size_mb=round(new_size / 1024**2, 1),
+            saved_mb=round(saved_mb, 1),
+        )
+        return {
+            "nodes": len(node_rows),
+            "edges": len(edge_rows),
+            "clusters": len(cluster_rows),
+            "old_size_mb": round(old_size / 1024**2, 1),
+            "new_size_mb": round(new_size / 1024**2, 1),
+            "saved_mb": round(saved_mb, 1),
+        }
+
 
 # ---------------------------------------------------------------------------
 # Utility
@@ -731,3 +985,27 @@ def _prefix_strip(row: dict) -> dict:
         key = k.split(".", 1)[-1] if "." in k else k
         out[key] = v
     return out
+
+
+def _node_return_projection(include_embedding: bool) -> str:
+    columns = [
+        "n.id AS id",
+        "n.collection AS collection",
+        "n.content AS content",
+        "n.node_type AS node_type",
+        "n.tier AS tier",
+        "n.importance AS importance",
+        "n.source AS source",
+        "n.source_agent_id AS source_agent_id",
+        "n.tags AS tags",
+        "n.metadata AS metadata",
+        "n.parent_node_ids AS parent_node_ids",
+        "n.pinned AS pinned",
+        "n.created_at AS created_at",
+        "n.updated_at AS updated_at",
+        "n.last_accessed AS last_accessed",
+        "n.access_count AS access_count",
+    ]
+    if include_embedding:
+        columns.append("n.embedding AS embedding")
+    return ", ".join(columns)

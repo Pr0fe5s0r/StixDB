@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 import typer
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -192,6 +193,242 @@ def collections_dedupe(
             f"\n[green]✓[/green]  Removed [bold red]{deleted}[/bold red] duplicate(s) "
             f"from [cyan]{name}[/cyan].  {remaining} nodes remain."
         )
+
+
+@collections_app.command("analyze")
+def collections_analyze(
+    name: str = typer.Argument(..., help="Collection name to analyze."),
+    host: str = typer.Option("localhost", help="Server host."),
+    port: int = typer.Option(0, help="Server port."),
+    sample: int = typer.Option(120, "--sample", "-s", help="Nodes to sample for similarity scan."),
+):
+    """
+    [bold]Diagnose why summary nodes are or aren't being created.[/bold]
+
+    Samples a slice of the collection and computes pairwise cosine similarities.
+    Shows the distribution and compares against the consolidation threshold so
+    you can see whether the threshold needs to be lowered.
+
+    Examples:
+      stixdb collections analyze proj_myapp
+      stixdb collections analyze proj_myapp --sample 200
+    """
+    base, api_key = _conn(host, port)
+
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as prog:
+        prog.add_task(f"Scanning similarity in [bold]{name}[/bold]…")
+        data = http_get(f"{base}/collections/{name}/similarity-scan?sample={sample}&top_k=15", api_key)
+
+    if "error" in data:
+        console.print(f"[red]{data['error']}[/red]")
+        return
+
+    threshold   = data["consolidation_threshold"]
+    above       = data["pairs_above_threshold"]
+    sampled     = data["nodes_sampled"]
+    pairs       = data["pairs_computed"]
+    stats       = data["stats"]
+    top_pairs   = data.get("top_pairs", [])
+
+    # ── Summary panel ────────────────────────────────────────────────────────
+    if above == 0:
+        verdict = f"[red]0 pairs above threshold ({threshold}) — no consolidation will fire.[/red]"
+        suggestion = (
+            f"\n  [dim]Highest similarity found: [bold]{stats['max']}[/bold]. "
+            f"Try lowering [cyan]consolidation_threshold[/cyan] in your config to "
+            f"[bold]{max(0.5, round(stats['p95'] - 0.02, 2))}[/bold] "
+            f"(p95 of your data) to start seeing merges.[/dim]"
+        )
+    else:
+        verdict = f"[green]{above} pair(s) above threshold ({threshold}) — consolidation will merge them.[/green]"
+        suggestion = ""
+
+    console.print(Panel(
+        f"{verdict}{suggestion}",
+        title=f"[bold]Similarity Analysis: {name}[/bold]",
+        border_style="cyan",
+        padding=(0, 2),
+    ))
+
+    # ── Stats table ───────────────────────────────────────────────────────────
+    synth_lower = data.get("synthesis_lower", 0.55)   # provided by server if available
+    st = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+    st.add_column("Metric", style="bold")
+    st.add_column("Value", justify="right")
+    st.add_row("Nodes sampled",              str(sampled))
+    st.add_row("Pairs computed",             str(pairs))
+    st.add_row("Synthesis zone",             f"[cyan]{synth_lower:.2f}[/cyan] – [yellow]{threshold}[/yellow]")
+    st.add_row("Merge threshold",            f"[yellow]{threshold}[/yellow]")
+    st.add_row("Pairs above threshold",      f"[{'green' if above else 'red'}]{above}[/]")
+    # count synthesis-zone pairs
+    synth_pairs = sum(
+        1 for p in top_pairs
+        if not p["above_threshold"] and p["similarity"] >= synth_lower
+    )
+    st.add_row("Pairs in synthesis zone",    f"[cyan]{synth_pairs}[/cyan] (visible in top-15)")
+    st.add_row("Min similarity",             str(stats["min"]))
+    st.add_row("Mean similarity",            str(stats["mean"]))
+    st.add_row("Median similarity",          str(stats["median"]))
+    st.add_row("p75",                        str(stats["p75"]))
+    st.add_row("p90",                        str(stats["p90"]))
+    st.add_row("p95",                        str(stats["p95"]))
+    st.add_row("p99",                        str(stats["p99"]))
+    st.add_row("Max similarity",             f"[bold]{stats['max']}[/bold]")
+    console.print(st)
+
+    # ── Top pairs table ───────────────────────────────────────────────────────
+    if top_pairs:
+        pt = Table(
+            title="Top Similar Pairs",
+            box=box.SIMPLE, show_header=True, header_style="bold cyan",
+        )
+        pt.add_column("Sim", justify="right", style="bold", width=6)
+        pt.add_column("Zone", width=12)
+        pt.add_column("Node A (preview)")
+        pt.add_column("Node B (preview)")
+        for p in top_pairs[:15]:
+            sim = p["similarity"]
+            if p["above_threshold"]:
+                zone_label = "[green]merge[/green]"
+                color = "green"
+            elif sim >= synth_lower:
+                zone_label = "[cyan]synthesis[/cyan]"
+                color = "cyan"
+            else:
+                zone_label = "[dim]none[/dim]"
+                color = ""
+            pt.add_row(
+                f"[{color}]{sim}[/]" if color else str(sim),
+                zone_label,
+                escape(p["content_a"]),
+                escape(p["content_b"]),
+            )
+        console.print(pt)
+
+    console.print()
+
+
+@collections_app.command("clean")
+def collections_clean(
+    name: str = typer.Argument(..., help="Collection name to clean."),
+    host: str = typer.Option("localhost", help="Server host."),
+    port: int = typer.Option(0, help="Server port."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", "-n",
+        help="Preview what would be removed without deleting anything.",
+    ),
+):
+    """
+    [bold]Remove garbage maintenance nodes[/bold] from a collection.
+
+    Deletes auto-generated maintenance/consolidator summary nodes whose
+    content is empty, an error phrase, or a raw JSON fragment — nodes
+    that pollute search results and working memory without adding value.
+
+    Use [cyan]--dry-run[/cyan] to preview what would be removed.
+
+    Examples:
+      stixdb collections clean proj_myapp --dry-run
+      stixdb collections clean proj_myapp
+    """
+    base, api_key = _conn(host, port)
+
+    # Pull all nodes from the server
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as prog:
+        prog.add_task(f"Scanning [bold]{name}[/bold] for garbage nodes…")
+        data = http_get(f"{base}/collections/{name}/nodes?limit=10000", api_key)
+
+    nodes = data if isinstance(data, list) else data.get("nodes", [])
+
+    # --- Garbage detection (mirrors engine._is_useful_maintenance_answer) ---
+    _internal_sources = {"agent-maintenance", "agent-consolidator", "agent-reflection"}
+    _garbage_phrases = (
+        "returned an empty response",
+        "no answer",
+        "no relevant",
+        "i don't have",
+        "i do not have",
+        "cannot answer",
+        "not enough information",
+        "no information",
+        "unable to",
+        "i couldn't find",
+        "i could not find",
+    )
+
+    def _is_garbage(node: dict) -> bool:
+        source = (node.get("source") or "").strip().lower()
+        if source not in _internal_sources:
+            return False
+        content = (node.get("content") or "").strip()
+        if not content or len(content) < 30:
+            return True
+
+        # Maintenance nodes are stored as "Label\n\nAnswer body".
+        # Extract the body (everything after the first blank line) so we can
+        # check the answer independently of the label prefix.
+        parts = content.split("\n\n", 1)
+        body = parts[1].strip() if len(parts) == 2 else content
+
+        # Raw JSON response — LLM returned structured output instead of prose
+        if body.startswith("{") or body.startswith("["):
+            return True
+        # Full content also checked (handles edge cases with no label)
+        if content.startswith("{") or content.startswith("["):
+            return True
+
+        lower = content.lower()
+        return any(phrase in lower for phrase in _garbage_phrases)
+
+    garbage = [n for n in nodes if _is_garbage(n)]
+
+    if not garbage:
+        console.print(
+            f"[green]✓[/green]  [bold]{name}[/bold] is clean — "
+            f"no garbage maintenance nodes found ({len(nodes)} nodes scanned)."
+        )
+        return
+
+    t = Table(
+        title=f"{'[dim][DRY RUN][/dim] ' if dry_run else ''}Garbage nodes in {name}",
+        box=box.SIMPLE,
+        header_style="bold cyan",
+    )
+    t.add_column("#", justify="right", style="dim")
+    t.add_column("Source", style="dim")
+    t.add_column("Label / Content preview")
+    for i, node in enumerate(garbage[:20], 1):
+        label = escape((node.get("content") or "")[:80].replace("\n", " "))
+        t.add_row(str(i), escape(node.get("source", "")), label)
+    if len(garbage) > 20:
+        t.add_row("…", "", f"[dim]… and {len(garbage) - 20} more[/dim]")
+    console.print(t)
+
+    if dry_run:
+        console.print(
+            f"\n[dim]Dry run — nothing deleted.  "
+            f"Run without [bold]--dry-run[/bold] to remove {len(garbage)} node(s).[/dim]"
+        )
+        return
+
+    deleted = 0
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as prog:
+        task = prog.add_task(f"Deleting {len(garbage)} garbage node(s)…")
+        for node in garbage:
+            node_id = node.get("id") or node.get("node_id", "")
+            if not node_id:
+                continue
+            try:
+                http_delete(f"{base}/collections/{name}/nodes/{node_id}", api_key)
+                deleted += 1
+            except Exception:
+                pass
+        prog.update(task, completed=True)
+
+    console.print(
+        f"\n[green]✓[/green]  Removed [bold red]{deleted}[/bold red] garbage node(s) "
+        f"from [cyan]{name}[/cyan]."
+    )
 
 
 # ── ingest ─────────────────────────────────────────────────────────────────────
@@ -438,20 +675,21 @@ def _ingest_folder(
         for fpath, state in zip(all_files, states):
             rel = _rel(fpath)
             s = state["status"]
+            rel_safe = escape(rel)
             if s == "waiting":
-                t.add_row(f"[dim]{rel}[/dim]", "[dim]· waiting[/dim]", "")
+                t.add_row(f"[dim]{rel_safe}[/dim]", "[dim]· waiting[/dim]", "")
             elif s == "uploading":
-                t.add_row(f"[bold white]{rel}[/bold white]",
+                t.add_row(f"[bold white]{rel_safe}[/bold white]",
                           f"[yellow]{spin} uploading[/yellow]", "")
             elif s == "done":
-                t.add_row(rel,
+                t.add_row(rel_safe,
                           "[green]✓ done[/green]",
                           f"[dim]{state['chunks']} chunks[/dim]")
             elif s == "error":
-                t.add_row(f"[red]{rel}[/red]",
+                t.add_row(f"[red]{rel_safe}[/red]",
                           "[red]✗ error[/red]", "")
             else:
-                t.add_row(f"[dim]{rel}[/dim]", "[dim]— skipped[/dim]", "")
+                t.add_row(f"[dim]{rel_safe}[/dim]", "[dim]— skipped[/dim]", "")
         return t
 
     overall = Progress(
@@ -596,7 +834,7 @@ def cmd_search(
     port: int = typer.Option(0, help="Server port."),
     top_k: int = typer.Option(5, "--top-k", "-k", help="Number of results to return."),
     threshold: float = typer.Option(0.25, help="Minimum similarity score  0.0 – 1.0."),
-    depth: int = typer.Option(1, help="Graph expansion depth (higher = more context, slower)."),
+    depth: int = typer.Option(0, help="Graph expansion depth (higher = more context, slower)."),
     tags: str = typer.Option("", "--tags", "-t", help="Filter results by these tags."),
     json_output: bool = typer.Option(False, "--json", help="Output raw JSON instead of formatted results."),
 ):
@@ -618,7 +856,7 @@ def cmd_search(
     payload = {
         "query": query,
         "collection": coll,
-        "top_k": top_k * 3,
+        "top_k": top_k,
         "max_results": top_k,
         "threshold": threshold,
         "depth": depth,
@@ -664,7 +902,7 @@ def cmd_search(
             f"[dim]{bar}[/dim] [bold]{score:.3f}[/bold]"
             + (f"  {' · '.join(meta)}" if meta else "")
         )
-        console.print(f"     {snippet}")
+        console.print(f"     {escape(snippet)}")
 
     console.print()
 
@@ -735,7 +973,7 @@ def cmd_ask(
 
     if answer:
         console.print(Panel(
-            answer,
+            escape(answer),
             title="[bold green]Answer[/bold green]",
             border_style="green",
             padding=(1, 2),
@@ -752,7 +990,7 @@ def cmd_ask(
                 snippet = str(src.get("content") or src.get("snippet", ""))[:120]
             else:
                 node_id, snippet = "", str(src)[:120]
-            t.add_row(str(i), node_id, snippet)
+            t.add_row(str(i), escape(str(node_id)), escape(snippet))
         console.print(t)
 
     if reasoning:
@@ -760,7 +998,7 @@ def cmd_ask(
         limit = 2000
         preview = reasoning[:limit] + ("…" if len(reasoning) > limit else "")
         console.print(Panel(
-            f"[dim]{preview}[/dim]",
+            f"[dim]{escape(preview)}[/dim]",
             title="[dim]Thinking[/dim]",
             border_style="dim",
             padding=(0, 2),

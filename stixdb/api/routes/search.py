@@ -112,6 +112,17 @@ def _title_for_result(node: dict[str, Any]) -> str:
     return first_line[:77] + "..."
 
 
+def _title_from_content(content: str) -> str:
+    content = content.strip()
+    if not content:
+        return "Untitled memory"
+
+    first_line = content.splitlines()[0].strip()
+    if len(first_line) <= 80:
+        return first_line
+    return first_line[:77] + "..."
+
+
 def _truncate_text(text: str, max_chars: int) -> str:
     if max_chars <= 0 or len(text) <= max_chars:
         return text
@@ -144,6 +155,19 @@ def _matches_tags(node_tags: list[str], required_tags: list[str]) -> bool:
     return any(tag.lower() in node_tags_lc for tag in required_tags)
 
 
+def _can_use_vector_only_search(body: "SearchRequest") -> bool:
+    return (
+        body.depth == 0
+        and not body.source_filter
+        and not body.tag_filter
+        and not body.node_type_filter
+        and not body.tier_filter
+        and not body.include_metadata
+        and not body.include_heatmap
+        and body.sort_by == "relevance"
+    )
+
+
 def _to_search_result(
     collection: str,
     node: dict[str, Any],
@@ -172,6 +196,29 @@ def _to_search_result(
     if include_heatmap:
         result["heatmap"] = _build_heatmap(node)
     return result
+
+
+def _vector_hit_to_search_result(
+    collection: str,
+    hit: Any,
+    max_chars_per_result: int,
+) -> dict[str, Any]:
+    content = str(getattr(hit, "content", "") or "")
+    return {
+        "title": _title_from_content(content),
+        "source": "unknown",
+        "collection": collection,
+        "node_id": hit.node_id,
+        "snippet": _truncate_text(content, max_chars_per_result),
+        "score": round(float(hit.score), 6),
+        "node_type": None,
+        "tier": None,
+        "importance": None,
+        "tags": [],
+        "created_at": None,
+        "last_accessed": None,
+        "metadata": {},
+    }
 
 
 class SearchRequest(BaseModel):
@@ -206,7 +253,7 @@ class SearchRequest(BaseModel):
         description="Minimum semantic similarity threshold.",
     )
     depth: int = Field(
-        default=1,
+        default=0,
         ge=0,
         le=4,
         description="Graph expansion depth from seed matches.",
@@ -284,6 +331,31 @@ async def _search_collection(
     return results
 
 
+async def _search_collection_vector_only(
+    graph: Any,
+    collection: str,
+    query: str,
+    query_embedding: Any,
+    top_k: int,
+    threshold: float,
+    max_chars_per_result: int,
+) -> list[dict[str, Any]]:
+    hits = await graph.semantic_search_hits_from_embedding(
+        query_embedding=query_embedding,
+        query=query,
+        top_k=top_k,
+        threshold=threshold,
+    )
+    return [
+        _vector_hit_to_search_result(
+            collection=collection,
+            hit=hit,
+            max_chars_per_result=max_chars_per_result,
+        )
+        for hit in hits
+    ]
+
+
 def _filter_and_rank_results(
     collection: str,
     nodes: list[dict[str, Any]],
@@ -350,34 +422,57 @@ async def search(body: SearchRequest, request: Request):
 
     target_collections = list(dict.fromkeys(([body.collection] if body.collection else []) + body.collections))
     queries = body.query if isinstance(body.query, list) else [body.query]
+    vector_only_search = _can_use_vector_only_search(body)
+    vector_only_graphs: dict[str, Any] = {}
+    if vector_only_search:
+        for collection in target_collections:
+            graph, _, _ = await engine._ensure_collection(collection)
+            vector_only_graphs[collection] = graph
 
     query_results: list[dict[str, Any]] = []
     for query_text in queries:
         merged_results: list[dict[str, Any]] = []
         searched_collections: list[str] = []
+        query_embedding = None
+        vector_only_top_k = min(body.top_k, body.max_results)
+
+        if vector_only_search:
+            query_embedding = await engine._embedding_client.embed_text(query_text)
 
         for collection in target_collections:
-            collection_results = await _search_collection(
-                engine=engine,
-                collection=collection,
-                query=query_text,
-                top_k=body.top_k,
-                threshold=body.threshold,
-                depth=body.depth,
-            )
-            filtered_results = _filter_and_rank_results(
-                collection=collection,
-                nodes=collection_results,
-                source_filter=body.source_filter,
-                tag_filter=body.tag_filter,
-                node_type_filter=body.node_type_filter,
-                tier_filter=body.tier_filter,
-                max_chars_per_result=body.max_chars_per_result,
-                include_metadata=body.include_metadata,
-                include_heatmap=body.include_heatmap or body.sort_by in {"heat", "hybrid"},
-                sort_by=body.sort_by,
-            )
-            merged_results.extend(filtered_results)
+            if vector_only_search:
+                collection_results = await _search_collection_vector_only(
+                    graph=vector_only_graphs[collection],
+                    collection=collection,
+                    query=query_text,
+                    query_embedding=query_embedding,
+                    top_k=vector_only_top_k,
+                    threshold=body.threshold,
+                    max_chars_per_result=body.max_chars_per_result,
+                )
+                merged_results.extend(collection_results)
+            else:
+                collection_results = await _search_collection(
+                    engine=engine,
+                    collection=collection,
+                    query=query_text,
+                    top_k=body.top_k,
+                    threshold=body.threshold,
+                    depth=body.depth,
+                )
+                filtered_results = _filter_and_rank_results(
+                    collection=collection,
+                    nodes=collection_results,
+                    source_filter=body.source_filter,
+                    tag_filter=body.tag_filter,
+                    node_type_filter=body.node_type_filter,
+                    tier_filter=body.tier_filter,
+                    max_chars_per_result=body.max_chars_per_result,
+                    include_metadata=body.include_metadata,
+                    include_heatmap=body.include_heatmap or body.sort_by in {"heat", "hybrid"},
+                    sort_by=body.sort_by,
+                )
+                merged_results.extend(filtered_results)
             searched_collections.append(collection)
 
         if body.sort_by == "heat":

@@ -19,6 +19,8 @@ from typing import Awaitable, Callable, Optional
 from stixdb.graph.memory_graph import MemoryGraph
 from stixdb.agent.planner import AccessPlanner
 from stixdb.agent.consolidator import Consolidator
+from stixdb.agent.weaver import RelationWeaver
+from stixdb.agent.prefetcher import PredictivePrefetcher
 from stixdb.config import AgentConfig
 from stixdb.observability.tracer import get_tracer
 
@@ -62,11 +64,15 @@ class MemoryAgentWorker:
         graph: MemoryGraph,
         planner: AccessPlanner,
         consolidator: Consolidator,
+        weaver: RelationWeaver,
+        prefetcher: PredictivePrefetcher,
         config: AgentConfig,
     ) -> None:
         self.graph = graph
         self.planner = planner
         self.consolidator = consolidator
+        self.weaver = weaver
+        self.prefetcher = prefetcher
         self.config = config
         self._tracer = get_tracer()
 
@@ -178,8 +184,32 @@ class MemoryAgentWorker:
         # Run consolidation (merge + prune + cluster rebuild)
         consolidation_result = await self.consolidator.run_cycle()
         maintenance_result = None
-        if self._maintenance_callback is not None:
+        should_run_maintenance = (
+            self._maintenance_callback is not None
+            and self._status.cycle_count > 0
+            and self._status.cycle_count % 10 == 0
+        )
+        if should_run_maintenance:
+            # Maintenance is useful, but it must not monopolize the hot path.
             maintenance_result = await self._maintenance_callback()
+
+        # ── WEAVE ────────────────────────────────────────────────────────
+        # Discover and create typed edges between related-but-distinct nodes
+        weaver_result = None
+        if self.config.enable_relation_weaving:
+            try:
+                weaver_result = await self.weaver.run_pass()
+            except Exception as exc:
+                logger.warning("Relation weaver pass failed", error=str(exc))
+
+        # ── PREFETCH ─────────────────────────────────────────────────────
+        # Pre-warm working memory from past query patterns
+        prefetch_result = None
+        if self.config.enable_predictive_prefetch:
+            try:
+                prefetch_result = await self.prefetcher.run_pass()
+            except Exception as exc:
+                logger.warning("Predictive prefetch pass failed", error=str(exc))
 
         # Update status
         duration_ms = (time.time() - cycle_start) * 1000
@@ -202,7 +232,13 @@ class MemoryAgentWorker:
             promotes=promotes,
             demotes=demotes,
             merged=len(consolidation_result.merged_pairs),
+            synthesized=len(consolidation_result.synthesized_summaries),
             pruned=len(consolidation_result.pruned_node_ids),
+            woven=(weaver_result.edges_created.__len__() if weaver_result else 0),
+            prefetched=(
+                len((prefetch_result.promoted if prefetch_result else []))
+                + len((prefetch_result.fan_out if prefetch_result else []))
+            ),
             maintenance_updates=(maintenance_result or {}).get("updated", 0),
             duration_ms=f"{duration_ms:.1f}",
         )

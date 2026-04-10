@@ -20,7 +20,7 @@ from rich import box
 
 from stixdb.cli._helpers import (
     GLOBAL_DIR, GLOBAL_CONFIG,
-    console, load_global_config, server_url, http_get,
+    console, load_global_config, server_url, http_get, http_post,
     resolved_port, resolved_api_key, require_global_config,
 )
 
@@ -217,3 +217,48 @@ def cmd_info(
     console.print()
     console.print(t)
     console.print()
+
+
+def cmd_compact(
+    host: str = typer.Option("localhost", help="Server host."),
+    port: int = typer.Option(0, help="Server port."),
+):
+    """
+    [bold]Reclaim wasted disk space by rebuilding the KuzuDB file.[/bold]
+
+    KuzuDB pre-allocates a buffer pool (~80 % of system RAM by default) which
+    bloats the on-disk file to gigabytes even for small datasets.
+    Running [cyan]compact[/cyan] exports all data, deletes the old file, and recreates
+    it with a controlled 256 MB buffer pool — then reimports everything.
+
+    The server must be running.  The operation is safe but takes a few seconds.
+
+    Example:
+      stixdb compact
+    """
+    base = server_url(host, port)
+    api_key = resolved_api_key()
+
+    console.print("[dim]Compacting storage — this may take a moment…[/dim]")
+    result = http_post(f"{base}/storage/compact", {}, api_key=api_key, timeout=300)
+
+    if "error" in result:
+        console.print(f"[red]{result['error']}[/red]")
+        raise typer.Exit(1)
+
+    old_mb  = result.get("old_size_mb", "?")
+    new_mb  = result.get("new_size_mb", "?")
+    saved   = result.get("saved_mb", "?")
+    nodes   = result.get("nodes", "?")
+    edges   = result.get("edges", "?")
+
+    console.print(Panel(
+        f"[green]✓[/green]  Storage compacted\n\n"
+        f"  Nodes reimported : [bold]{nodes}[/bold]\n"
+        f"  Edges reimported : [bold]{edges}[/bold]\n"
+        f"  Before           : [bold]{old_mb} MB[/bold]\n"
+        f"  After            : [bold green]{new_mb} MB[/bold green]\n"
+        f"  Saved            : [bold cyan]{saved} MB[/bold cyan]",
+        title="Storage Compact",
+        border_style="green",
+    ))

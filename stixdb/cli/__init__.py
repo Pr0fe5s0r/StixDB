@@ -60,6 +60,7 @@ from stixdb.cli._server import (
     cmd_serve,
     cmd_status,
     cmd_info,
+    cmd_compact,
 )
 
 # ── Main app ───────────────────────────────────────────────────────────────────
@@ -99,6 +100,7 @@ app.command("store")(cmd_store)
 app.command("search")(cmd_search)
 app.command("ask")(cmd_ask)
 app.command("graph")(cmd_graph)
+app.command("compact")(cmd_compact)
 
 
 if __name__ == "__main__":

@@ -50,7 +50,10 @@ async def lifespan(app: FastAPI):
             logging.critical(
                 "StixDB startup failed — DISK FULL.\n"
                 f"  Storage path: {config.storage.data_dir}\n"
-                "  Free up disk space or change 'storage.path' in ~/.stixdb/config.json."
+                "  Free up disk space or change 'storage.path' in ~/.stixdb/config.json.\n"
+                "  To reclaim space: start the server once disk is freed, then run\n"
+                "    stixdb compact\n"
+                "  to rebuild the KuzuDB file at its minimum size."
             )
         else:
             logging.critical("StixDB engine failed to start: %s", exc)
@@ -145,6 +148,20 @@ async def health(request: Request):
         "status": "ok",
         "collections": await eng.list_collections_async(),
     }
+
+
+@app.post("/storage/compact", tags=["Storage"])
+async def compact_storage(request: Request):
+    """
+    Reclaim wasted disk space by rebuilding the KuzuDB file.
+
+    KuzuDB pre-allocates buffer-pool-sized pages (~80% of system RAM by default),
+    causing the file to balloon to gigabytes even for small datasets.
+    This endpoint exports all data, deletes the old file, recreates it with a
+    controlled 256 MB buffer pool, and reimports everything.
+    """
+    eng: StixDBEngine = request.app.state.engine
+    return await eng.compact_storage()
 
 
 @app.get("/traces", tags=["Observability"])

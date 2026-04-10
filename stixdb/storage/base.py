@@ -81,6 +81,7 @@ class StorageBackend(ABC):
         node_type: Optional[str] = None,
         limit: int = 1000,
         offset: int = 0,
+        include_embedding: bool = False,
     ) -> list[MemoryNode]:
         """List nodes in a collection with optional filters."""
         ...

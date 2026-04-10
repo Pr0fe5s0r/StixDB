@@ -245,6 +245,82 @@ async def delete_collection(collection: str, request: Request):
     return await engine.delete_collection(collection)
 
 
+@router.get("/{collection}/similarity-scan")
+async def similarity_scan(
+    collection: str,
+    request: Request,
+    sample: int = 120,
+    top_k: int = 20,
+):
+    """
+    Sample nodes and return pairwise cosine similarity statistics.
+    Helps diagnose why consolidation is or isn't firing.
+    """
+    import numpy as np
+
+    engine: StixDBEngine = request.app.state.engine
+    graph, _, _ = await engine._ensure_collection(collection)
+    threshold = engine.config.agent.consolidation_similarity_threshold
+    synthesis_lower = engine.config.agent.synthesis_similarity_lower
+
+    # Grab a sample of active (non-archived) nodes that have embeddings
+    all_nodes = await graph.list_nodes(limit=sample * 3)
+    embedded = [
+        (n, np.array(n.embedding, dtype=np.float32))
+        for n in all_nodes
+        if n.embedding is not None
+        and n.tier.value != "archived"
+        and n.node_type.value != "summary"
+    ][:sample]
+
+    if len(embedded) < 2:
+        return {"error": "Not enough embedded nodes to compute similarity", "count": len(embedded)}
+
+    # Pairwise cosine similarities (upper triangle)
+    similarities: list[float] = []
+    top_pairs: list[dict] = []
+
+    for i in range(len(embedded)):
+        node_a, emb_a = embedded[i]
+        for j in range(i + 1, len(embedded)):
+            node_b, emb_b = embedded[j]
+            sim = float(np.clip(np.dot(emb_a, emb_b), -1.0, 1.0))
+            similarities.append(sim)
+            if sim >= 0.35:  # only track potentially interesting pairs
+                top_pairs.append({
+                    "node_a": node_a.id[:12],
+                    "node_b": node_b.id[:12],
+                    "content_a": node_a.content[:80].replace("\n", " "),
+                    "content_b": node_b.content[:80].replace("\n", " "),
+                    "similarity": round(sim, 4),
+                    "above_threshold": sim >= threshold,
+                })
+
+    top_pairs.sort(key=lambda x: x["similarity"], reverse=True)
+    sims = np.array(similarities, dtype=np.float32)
+    above = int(np.sum(sims >= threshold))
+
+    return {
+        "collection": collection,
+        "nodes_sampled": len(embedded),
+        "pairs_computed": len(similarities),
+        "consolidation_threshold": threshold,
+        "synthesis_lower": synthesis_lower,
+        "pairs_above_threshold": above,
+        "stats": {
+            "min":    round(float(np.min(sims)), 4),
+            "max":    round(float(np.max(sims)), 4),
+            "mean":   round(float(np.mean(sims)), 4),
+            "median": round(float(np.median(sims)), 4),
+            "p75":    round(float(np.percentile(sims, 75)), 4),
+            "p90":    round(float(np.percentile(sims, 90)), 4),
+            "p95":    round(float(np.percentile(sims, 95)), 4),
+            "p99":    round(float(np.percentile(sims, 99)), 4),
+        },
+        "top_pairs": top_pairs[:top_k],
+    }
+
+
 @router.get("/{collection}/graph")
 async def export_graph(
     collection: str,

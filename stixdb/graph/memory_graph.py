@@ -8,6 +8,8 @@ VectorStore (semantic search), keeping them in sync.
 from __future__ import annotations
 
 import hashlib
+import heapq
+import numpy as np
 import re
 import time
 from typing import Optional, Union
@@ -15,8 +17,10 @@ from typing import Optional, Union
 from stixdb.graph.node import MemoryNode, NodeType, MemoryTier
 from stixdb.graph.edge import RelationEdge, RelationType
 from stixdb.graph.cluster import MemoryCluster, ClusterType
+from stixdb.graph.summary_index import extract_summary_connection_entries
 from stixdb.storage.base import StorageBackend
 from stixdb.storage.embeddings import EmbeddingClient
+from stixdb.storage.vector_store import MemoryVectorStore
 from stixdb.storage.vector_store import VectorSearchResult
 
 
@@ -47,19 +51,66 @@ class MemoryGraph:
 
     async def initialize(self) -> None:
         await self._storage.initialize(self.collection)
-        existing_nodes = await self._storage.list_nodes(self.collection, limit=1_000_000, offset=0)
-        for node in existing_nodes:
-            embedding = node.get_embedding_array()
-            if embedding is None:
-                embedding = await self._embedding_client.embed_text(node.content)
-                node.set_embedding(embedding)
-                await self._storage.upsert_node(node)
-            await self._vector_store.upsert(
-                collection=self.collection,
-                node_id=node.id,
-                embedding=embedding,
-                content=node.content,
+
+        # Persistent vector stores only need a rebuild when they are missing
+        # data. The in-memory vector backend is treated as a hot cache and
+        # should not load the entire corpus into RAM.
+        if isinstance(self._vector_store, MemoryVectorStore):
+            working_nodes = await self._storage.list_nodes(
+                self.collection,
+                tier=MemoryTier.WORKING.value,
+                limit=1000,
+                offset=0,
+                include_embedding=True,
             )
+            await self._seed_vector_store(working_nodes, allow_embedding_generation=True)
+            return
+
+        try:
+            storage_count = await self._storage.count_nodes(self.collection)
+            vector_count = await self._vector_store.count(self.collection)
+            if storage_count > 0 and vector_count >= storage_count:
+                return
+        except Exception:
+            pass
+
+        # Paginate initialization to avoid pinning too many pages in the database buffer pool.
+        batch_size = 250
+        offset = 0
+        while True:
+            existing_nodes = await self._storage.list_nodes(
+                self.collection,
+                limit=batch_size,
+                offset=offset,
+                include_embedding=True,
+            )
+            if not existing_nodes:
+                break
+
+            await self._seed_vector_store(existing_nodes, allow_embedding_generation=False)
+
+            offset += len(existing_nodes)
+            if len(existing_nodes) < batch_size:
+                break
+
+    async def _sync_vector_store(self, node: MemoryNode) -> None:
+        """Keep the vector index aligned with the node's tier."""
+        if isinstance(self._vector_store, MemoryVectorStore) and node.tier != MemoryTier.WORKING:
+            await self._vector_store.delete(self.collection, node.id)
+            return
+
+        embedding = node.get_embedding_array()
+        if embedding is None:
+            embedding = await self._embedding_client.embed_text(node.content)
+            node.set_embedding(embedding)
+            await self._storage.upsert_node(node)
+
+        await self._vector_store.upsert(
+            collection=self.collection,
+            node_id=node.id,
+            embedding=embedding,
+            content=node.content,
+        )
 
     # ------------------------------------------------------------------ #
     # Node Operations                                                      #
@@ -75,6 +126,7 @@ class MemoryGraph:
         source_agent_id: Optional[str] = None,
         tags: Optional[list[str]] = None,
         metadata: Optional[dict] = None,
+        parent_node_ids: Optional[list[str]] = None,
         pinned: bool = False,
         node_id: Optional[str] = None,
     ) -> MemoryNode:
@@ -90,28 +142,31 @@ class MemoryGraph:
             source_agent_id=source_agent_id,
             tags=tags or [],
             metadata=metadata or {},
+            parent_node_ids=parent_node_ids or [],
             pinned=pinned,
         )
         # Compute embedding
         embedding = await self._embedding_client.embed_text(content)
         node.set_embedding(embedding)
 
-        # Persist in both graph + vector store atomically
+        # Persist in graph and sync the hot vector cache when applicable.
         await self._storage.upsert_node(node)
-        await self._vector_store.upsert(
-            collection=self.collection,
-            node_id=node.id,
-            embedding=embedding,
-            content=content,
-        )
+        await self._sync_vector_store(node)
         return node
 
     async def get_node(self, node_id: str) -> Optional[MemoryNode]:
         return await self._storage.get_node(node_id, self.collection)
 
+    async def get_nodes(self, node_ids: list[str]) -> list[MemoryNode]:
+        if not node_ids:
+            return []
+        unique_ids = list(dict.fromkeys(node_ids))
+        return await self._storage.get_nodes(unique_ids, self.collection)
+
     async def update_node(self, node: MemoryNode) -> None:
         """Persist changes to an existing MemoryNode. Re-embeds if content changed."""
         await self._storage.upsert_node(node)
+        await self._sync_vector_store(node)
 
     async def touch_node(self, node_id: str) -> Optional[MemoryNode]:
         """Record a read access on a node."""
@@ -138,9 +193,15 @@ class MemoryGraph:
         node_type: Optional[str] = None,
         limit: int = 1000,
         offset: int = 0,
+        include_embedding: bool = False,
     ) -> list[MemoryNode]:
         return await self._storage.list_nodes(
-            self.collection, tier=tier, node_type=node_type, limit=limit, offset=offset
+            self.collection,
+            tier=tier,
+            node_type=node_type,
+            limit=limit,
+            offset=offset,
+            include_embedding=include_embedding,
         )
 
     async def count_nodes(self) -> int:
@@ -208,17 +269,12 @@ class MemoryGraph:
         Embed the query, search the vector store, then fetch full MemoryNodes.
         Returns (node, score) pairs sorted by descending score.
         """
-        query_embedding = await self._embedding_client.embed_text(query)
-        hits = await self._vector_store.search(
-            collection=self.collection,
-            query_embedding=query_embedding,
+        hits = await self.semantic_search_hits(
+            query=query,
             top_k=top_k,
             threshold=threshold,
         )
-        nodes = await self._storage.get_nodes(
-            [hit.node_id for hit in hits],
-            self.collection,
-        )
+        nodes = await self.get_nodes([hit.node_id for hit in hits])
         node_map = {node.id: node for node in nodes}
         results = []
         for hit in hits:
@@ -226,6 +282,135 @@ class MemoryGraph:
             if node is not None:
                 results.append((node, hit.score))
         return self._dedupe_ranked_nodes(results)
+
+    async def semantic_search_hits(
+        self,
+        query: str,
+        top_k: int = 10,
+        threshold: float = 0.3,
+    ) -> list[VectorSearchResult]:
+        """Return vector hits without hydrating full nodes from storage."""
+        query_embedding = await self._embedding_client.embed_text(query)
+        return await self.semantic_search_hits_from_embedding(
+            query_embedding=query_embedding,
+            query=query,
+            top_k=top_k,
+            threshold=threshold,
+        )
+
+    async def semantic_search_hits_from_embedding(
+        self,
+        query_embedding: np.ndarray,
+        query: str = "",
+        top_k: int = 10,
+        threshold: float = 0.3,
+    ) -> list[VectorSearchResult]:
+        """Search the vector index using a precomputed query embedding."""
+        return await self._vector_store.search(
+            collection=self.collection,
+            query_embedding=query_embedding,
+            top_k=top_k,
+            threshold=threshold,
+        )
+
+    async def _seed_vector_store(
+        self,
+        nodes: list[MemoryNode],
+        allow_embedding_generation: bool = True,
+    ) -> None:
+        for node in nodes:
+            embedding = node.get_embedding_array()
+            if embedding is None:
+                if not allow_embedding_generation:
+                    continue
+                embedding = await self._embedding_client.embed_text(node.content)
+                node.set_embedding(embedding)
+                await self._storage.upsert_node(node)
+            await self._vector_store.upsert(
+                collection=self.collection,
+                node_id=node.id,
+                embedding=embedding,
+                content=node.content,
+            )
+
+    async def _semantic_search_streaming(
+        self,
+        query: str,
+        query_embedding,
+        top_k: int,
+        threshold: float,
+    ) -> list[tuple[MemoryNode, float]]:
+        batch_size = 1000
+        offset = 0
+        best: list[tuple[float, int, MemoryNode]] = []
+        missing_candidates: list[tuple[float, int, MemoryNode]] = []
+        seq = 0
+        query_terms = self._query_terms(query)
+        missing_candidate_limit = max(top_k * 4, 64)
+
+        while True:
+            batch = await self._storage.list_nodes(
+                self.collection,
+                limit=batch_size,
+                offset=offset,
+                include_embedding=True,
+            )
+            if not batch:
+                break
+
+            valid_nodes: list[MemoryNode] = []
+            valid_embeddings = []
+            for node in batch:
+                embedding = node.get_embedding_array()
+                if embedding is None:
+                    lexical_score = self._lexical_candidate_score(node.content, query_terms)
+                    if lexical_score > 0.0:
+                        item = (lexical_score, seq, node)
+                        if len(missing_candidates) < missing_candidate_limit:
+                            heapq.heappush(missing_candidates, item)
+                        elif lexical_score > missing_candidates[0][0]:
+                            heapq.heapreplace(missing_candidates, item)
+                        seq += 1
+                    continue
+                valid_nodes.append(node)
+                valid_embeddings.append(embedding)
+
+            if valid_embeddings:
+                matrix = np.stack(valid_embeddings)
+                scores = matrix @ query_embedding
+                for node, score in zip(valid_nodes, scores):
+                    score_value = float(score)
+                    if score_value < threshold:
+                        continue
+                    item = (score_value, seq, node)
+                    if len(best) < top_k:
+                        heapq.heappush(best, item)
+                    elif score_value > best[0][0]:
+                        heapq.heapreplace(best, item)
+                    seq += 1
+
+            offset += len(batch)
+            if len(batch) < batch_size:
+                break
+
+        if missing_candidates:
+            shortlisted_nodes = [node for _, _, node in sorted(missing_candidates, reverse=True)]
+            missing_embeddings = await self._embedding_client.embed_batch(
+                [node.content for node in shortlisted_nodes]
+            )
+            for node, embedding in zip(shortlisted_nodes, missing_embeddings):
+                score_value = float(embedding @ query_embedding)
+                if score_value < threshold:
+                    continue
+                item = (score_value, seq, node)
+                if len(best) < top_k:
+                    heapq.heappush(best, item)
+                elif score_value > best[0][0]:
+                    heapq.heapreplace(best, item)
+                seq += 1
+
+        best.sort(key=lambda item: item[0], reverse=True)
+        return [(node, score) for score, _, node in best]
 
     async def semantic_search_with_graph_expansion(
         self,
@@ -237,7 +422,8 @@ class MemoryGraph:
         """
         Two-phase retrieval:
         1. Semantic search → seed nodes
-        2. BFS graph expansion → context nodes
+        2. Summary metadata expansion → direct related nodes
+        3. BFS graph expansion → fallback context nodes
         
         Returns union, prioritised by: vector score > graph proximity
         """
@@ -245,15 +431,66 @@ class MemoryGraph:
         seen_ids: set[str] = {n.id for n, _ in seed_results}
         expanded: list[tuple[MemoryNode, float]] = list(seed_results)
 
-        if seed_results and depth > 0:
+        if not seed_results or depth <= 0:
+            return self._dedupe_ranked_nodes(expanded)
+
+        expansion_seeds = seed_results[: min(len(seed_results), max(4, top_k // 3))]
+        seed_score_map = {seed_node.id: seed_score for seed_node, seed_score in expansion_seeds}
+
+        summary_related_ids: list[str] = []
+        summary_related_scores: dict[str, float] = {}
+        summary_seed_related_ids: dict[str, list[str]] = {}
+        fallback_bfs_seed_ids: list[str] = []
+
+        for seed_node, seed_score in expansion_seeds:
+            if seed_node.node_type == NodeType.SUMMARY:
+                entries = extract_summary_connection_entries(seed_node.metadata or {})
+                if entries:
+                    max_related = max(4, min(24, top_k * max(1, depth)))
+                    related_ids: list[str] = []
+                    for entry in entries[:max_related]:
+                        node_id = str(entry.get("node_id") or "").strip()
+                        if not node_id or node_id == seed_node.id:
+                            continue
+                        related_ids.append(node_id)
+                        weight = max(0.1, float(entry.get("weight", 1.0) or 1.0))
+                        rank = max(1, int(entry.get("rank", 1) or 1))
+                        score = seed_score * 0.9 * weight / rank
+                        summary_related_scores[node_id] = max(
+                            summary_related_scores.get(node_id, 0.0),
+                            score,
+                        )
+                    if related_ids:
+                        summary_seed_related_ids[seed_node.id] = related_ids
+                        summary_related_ids.extend(related_ids)
+                        continue
+            fallback_bfs_seed_ids.append(seed_node.id)
+
+        if summary_related_ids:
+            related_nodes = await self.get_nodes(list(dict.fromkeys(summary_related_ids)))
+            returned_ids = {node.id for node in related_nodes}
+            for node in related_nodes:
+                if node.id in seen_ids:
+                    continue
+                seen_ids.add(node.id)
+                expanded.append((node, summary_related_scores.get(node.id, 0.0)))
+
+            # If a summary's metadata did not hydrate anything, fall back to graph traversal.
+            for seed_id, related_ids in summary_seed_related_ids.items():
+                if not any(node_id in returned_ids for node_id in related_ids):
+                    fallback_bfs_seed_ids.append(seed_id)
+
+        fallback_bfs_seed_ids = list(dict.fromkeys(fallback_bfs_seed_ids))
+        if fallback_bfs_seed_ids:
             neighbour_map = await self._storage.get_neighbours_for_nodes(
-                [seed_node.id for seed_node, _ in seed_results],
+                fallback_bfs_seed_ids,
                 self.collection,
                 direction="both",
                 max_depth=depth,
             )
-            for seed_node, seed_score in seed_results:
-                for nbr in neighbour_map.get(seed_node.id, []):
+            for seed_id in fallback_bfs_seed_ids:
+                seed_score = seed_score_map.get(seed_id, 0.0)
+                for nbr in neighbour_map.get(seed_id, []):
                     if nbr.id not in seen_ids:
                         seen_ids.add(nbr.id)
                         # Discount the neighbour score by depth penalty
@@ -323,16 +560,12 @@ class MemoryGraph:
                 source_agent_id=item.get("source_agent_id"),
                 tags=item.get("tags", []),
                 metadata=item.get("metadata", {}),
+                parent_node_ids=item.get("parent_node_ids", []),
                 pinned=item.get("pinned", False),
             )
             node.set_embedding(embedding)
             await self._storage.upsert_node(node)
-            await self._vector_store.upsert(
-                collection=self.collection,
-                node_id=node.id,
-                embedding=embedding,
-                content=node.content,
-            )
+            await self._sync_vector_store(node)
             nodes.append(node)
         return nodes
 
@@ -432,3 +665,32 @@ class MemoryGraph:
     def _hash_text(text: str) -> str:
         normalized = re.sub(r"\s+", " ", text or "").strip().lower()
         return hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _query_terms(query: str) -> set[str]:
+        return {term for term in re.findall(r"[a-zA-Z0-9_]+", query.lower()) if len(term) >= 3}
+
+    @staticmethod
+    def _lexical_candidate_score(content: str, query_terms: set[str]) -> float:
+        if not query_terms or not content:
+            return 0.0
+        lowered = content.lower()
+        hits = sum(1 for term in query_terms if term in lowered)
+        if hits == 0:
+            return 0.0
+        return hits / max(1, len(query_terms))
+
+    @staticmethod
+    def _best_hit_lexical_overlap(hits: list[VectorSearchResult], query_terms: set[str]) -> int:
+        best = 0
+        for hit in hits:
+            content = getattr(hit, "content", "") or ""
+            if not content:
+                continue
+            lowered = content.lower()
+            overlap = sum(1 for term in query_terms if term in lowered)
+            if overlap > best:
+                best = overlap
+                if best == len(query_terms):
+                    break
+        return best

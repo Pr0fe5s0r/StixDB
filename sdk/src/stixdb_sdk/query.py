@@ -49,6 +49,22 @@ class QueryAPI(_BaseResource):
             },
         )
 
+    def retrieve_vector_only(
+        self,
+        collection: str,
+        *,
+        query: str,
+        top_k: int = 10,
+        threshold: float = 0.25,
+    ) -> dict[str, Any]:
+        return self.retrieve(
+            collection,
+            query=query,
+            top_k=top_k,
+            threshold=threshold,
+            depth=0,
+        )
+
 
 class AsyncQueryAPI(_AsyncBaseResource):
     async def ask(
@@ -93,4 +109,20 @@ class AsyncQueryAPI(_AsyncBaseResource):
                 "threshold": threshold,
                 "depth": depth,
             },
+        )
+
+    async def retrieve_vector_only(
+        self,
+        collection: str,
+        *,
+        query: str,
+        top_k: int = 10,
+        threshold: float = 0.25,
+    ) -> dict[str, Any]:
+        return await self.retrieve(
+            collection,
+            query=query,
+            top_k=top_k,
+            threshold=threshold,
+            depth=0,
         )

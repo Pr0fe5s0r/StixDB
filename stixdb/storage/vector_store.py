@@ -12,6 +12,8 @@ All other components deal with MemoryNode objects and node IDs.
 from __future__ import annotations
 
 import asyncio
+import os
+import uuid
 from typing import Any, Optional
 
 import numpy as np
@@ -57,6 +59,9 @@ class MemoryVectorStore:
 
     async def delete_collection(self, collection: str) -> None:
         self._store.pop(collection, None)
+
+    async def count(self, collection: str) -> int:
+        return len(self._store.get(collection, {}))
 
     async def search(
         self, collection: str, query_embedding: np.ndarray, top_k: int = 10, threshold: float = 0.0
@@ -145,6 +150,16 @@ class ChromaVectorStore:
             pass
         self._collections.pop(collection, None)
 
+    async def count(self, collection: str) -> int:
+        client = self._get_client()
+        name = f"stix_{collection}"
+        loop = asyncio.get_event_loop()
+        try:
+            col = await loop.run_in_executor(None, lambda: client.get_collection(name))
+            return int(col.count())
+        except Exception:
+            return 0
+
     async def search(
         self, collection: str, query_embedding: np.ndarray, top_k: int = 10, threshold: float = 0.0
     ) -> list[VectorSearchResult]:
@@ -179,45 +194,78 @@ class ChromaVectorStore:
 class QdrantVectorStore:
     """Qdrant-backed high-performance vector store."""
 
-    EMBEDDING_DIM = 384  # all-MiniLM-L6-v2 dimension
-
-    def __init__(self, host: str = "localhost", port: int = 6333) -> None:
+    def __init__(
+        self,
+        embedding_dim: int = 384,
+        host: Optional[str] = None,
+        port: int = 6333,
+        path: Optional[str] = None,
+    ) -> None:
+        self.embedding_dim = int(embedding_dim)
         self.host = host
         self.port = port
+        self.path = path
         self._client = None
 
     def _get_client(self):
         if self._client is None:
             from qdrant_client import QdrantClient
-            self._client = QdrantClient(host=self.host, port=self.port)
+            if self.path:
+                os.makedirs(self.path, exist_ok=True)
+                self._client = QdrantClient(path=self.path)
+            else:
+                self._client = QdrantClient(host=self.host or "localhost", port=self.port)
         return self._client
+
+    @staticmethod
+    def _point_id(node_id: str) -> str:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"stixdb:{node_id}"))
 
     def _ensure_collection(self, collection: str) -> None:
         from qdrant_client import models as qm
         client = self._get_client()
         col_name = f"stix_{collection}"
         try:
-            client.get_collection(col_name)
+            info = client.get_collection(col_name)
+            vectors = getattr(getattr(info, "config", None), "params", None)
+            vectors = getattr(vectors, "vectors", None)
+            size = getattr(vectors, "size", None)
+            if size is not None and int(size) != self.embedding_dim:
+                client.delete_collection(col_name)
+                raise ValueError("qdrant collection embedding size mismatch")
         except Exception:
             client.create_collection(
                 collection_name=col_name,
                 vectors_config=qm.VectorParams(
-                    size=self.EMBEDDING_DIM,
+                    size=self.embedding_dim,
                     distance=qm.Distance.COSINE
                 ),
             )
+
+    async def count(self, collection: str) -> int:
+        client = self._get_client()
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(
+                None,
+                lambda: client.count(collection_name=f"stix_{collection}", exact=True),
+            )
+            return int(result.count)
+        except Exception:
+            return 0
 
     async def upsert(self, collection: str, node_id: str, embedding: np.ndarray, content: str) -> None:
         from qdrant_client import models as qm
         self._ensure_collection(collection)
         client = self._get_client()
         loop = asyncio.get_event_loop()
+        point_id = self._point_id(node_id)
         await loop.run_in_executor(
             None,
             lambda: client.upsert(
                 collection_name=f"stix_{collection}",
                 points=[qm.PointStruct(
-                    id=abs(hash(node_id)) % (2**63),
+                    id=point_id,
                     vector=embedding.tolist(),
                     payload={"node_id": node_id, "content": content},
                 )]
@@ -228,7 +276,7 @@ class QdrantVectorStore:
         from qdrant_client import models as qm
         client = self._get_client()
         loop = asyncio.get_event_loop()
-        point_id = abs(hash(node_id)) % (2**63)
+        point_id = self._point_id(node_id)
         await loop.run_in_executor(
             None,
             lambda: client.delete(
@@ -252,6 +300,7 @@ class QdrantVectorStore:
         self._ensure_collection(collection)
         client = self._get_client()
         loop = asyncio.get_event_loop()
+        from qdrant_client import models as qm
         hits = await loop.run_in_executor(
             None,
             lambda: client.query_points(
@@ -259,6 +308,7 @@ class QdrantVectorStore:
                 query=query_embedding.tolist(),
                 limit=top_k,
                 score_threshold=threshold,
+                search_params=qm.SearchParams(hnsw_ef=8, exact=False),
             )
         )
         return [
@@ -280,9 +330,10 @@ class QdrantVectorStore:
 
 def build_vector_store(
     backend: VectorBackend,
+    embedding_dim: int = 384,
     data_dir: Optional[str] = None,
     chroma_host: Optional[str] = None,
-    qdrant_host: str = "localhost",
+    qdrant_host: Optional[str] = None,
     qdrant_port: int = 6333,
 ) -> "MemoryVectorStore | ChromaVectorStore | QdrantVectorStore":
     if backend == VectorBackend.MEMORY:
@@ -290,6 +341,9 @@ def build_vector_store(
     elif backend == VectorBackend.CHROMA:
         return ChromaVectorStore(data_dir=data_dir, host=chroma_host)
     elif backend == VectorBackend.QDRANT:
-        return QdrantVectorStore(host=qdrant_host, port=qdrant_port)
+        if qdrant_host:
+            return QdrantVectorStore(embedding_dim=embedding_dim, host=qdrant_host, port=qdrant_port)
+        qdrant_dir = os.path.join(data_dir or "./stixdb_data", "qdrant")
+        return QdrantVectorStore(embedding_dim=embedding_dim, path=qdrant_dir)
     else:
         raise ValueError(f"Unknown vector backend: {backend}")

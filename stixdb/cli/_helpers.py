@@ -9,11 +9,22 @@ import os
 from pathlib import Path
 from typing import Optional
 
+import io
+import sys
+
 import typer
 from rich.console import Console
 from rich.panel import Panel
 
-console = Console()
+# On Windows the default stdout uses cp1252 which can't render Unicode glyphs
+# like ● or ✓.  Wrapping with a UTF-8 TextIOWrapper bypasses the legacy
+# Windows console renderer so all Rich markup works correctly.
+def _utf8_console() -> Console:
+    if hasattr(sys.stdout, "buffer"):
+        return Console(file=io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8"))
+    return Console()
+
+console = _utf8_console()
 
 # ── Universal paths ────────────────────────────────────────────────────────────
 #   ~/.stixdb/  is the single source of truth for all StixDB state.

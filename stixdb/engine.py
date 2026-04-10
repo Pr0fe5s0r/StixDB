@@ -42,6 +42,11 @@ import structlog
 
 from stixdb.config import StixDBConfig, StorageMode, VectorBackend, LLMProvider  # noqa: F401
 from stixdb.graph.memory_graph import MemoryGraph
+from stixdb.graph.summary_index import (
+    build_connection_entries,
+    build_summary_connection_index,
+    merge_summary_connection_index,
+)
 from stixdb.graph.node import NodeType, MemoryTier
 from stixdb.graph.edge import RelationType
 from stixdb.graph.cluster import ClusterType
@@ -55,7 +60,7 @@ from stixdb.agent.memory_agent import MemoryAgent
 from stixdb.agent.reasoner import Reasoner, ReasoningResult
 from stixdb.agent.sessions import SessionManager
 from stixdb.context.broker import ContextBroker
-from stixdb.context.response import ContextResponse
+from stixdb.context.response import ContextResponse, SourceNode
 from stixdb.observability.tracer import init_tracer, get_tracer
 
 logger = structlog.get_logger(__name__)
@@ -90,6 +95,7 @@ class StixDBEngine:
         self._storage_backend = self._build_storage_backend()
         self._vector_store = build_vector_store(
             backend=self.config.storage.vector_backend,
+            embedding_dim=self.config.embedding.dimensions,
             data_dir=self.config.storage.data_dir,
             chroma_host=self.config.storage.chroma_host,
             qdrant_host=self.config.storage.qdrant_host,
@@ -123,8 +129,12 @@ class StixDBEngine:
             logger.info(
                 "Using KuzuDB persistent storage",
                 path=self.config.storage.kuzu_path,
+                buffer_pool_mb=self.config.storage.kuzu_buffer_pool_mb,
             )
-            return KuzuBackend(db_path=self.config.storage.kuzu_path)
+            return KuzuBackend(
+                db_path=self.config.storage.kuzu_path,
+                buffer_pool_mb=self.config.storage.kuzu_buffer_pool_mb,
+            )
         except ImportError:
             logger.warning(
                 "kuzu package not installed — falling back to in-memory NetworkX backend.\n"
@@ -449,7 +459,10 @@ class StixDBEngine:
                         **segment_metadata,
                         **({"backup": backup_ref} if backup_ref else {}),
                     },
-                    "pinned": True,
+                    # Ingested chunks are NOT pinned — they should be eligible
+                    # for consolidation, synthesis, and archiving.  Only
+                    # explicitly user-created nodes should be pinned.
+                    "pinned": False,
                 })
                 chunk_index += 1
 
@@ -540,6 +553,21 @@ class StixDBEngine:
                 "sync_similarity": best_sim,
             })
             best_summary.metadata["source_lineage"] = lineage
+            best_summary.metadata["connection_index"] = merge_summary_connection_index(
+                best_summary.metadata,
+                summary_id=best_summary.id,
+                summary_kind=str(best_summary.metadata.get("summary_kind") or "synced_summary"),
+                source=best_summary.source or "agent-maintenance",
+                content_hash=self._hash_text(best_summary.content),
+                entries=build_connection_entries(
+                    [chunk_node.id],
+                    relation_type=RelationType.DERIVED_FROM,
+                    role="sync_evidence",
+                    weight=max(0.6, best_sim),
+                    source="ingest-sync",
+                ),
+            )
+            best_summary.parent_node_ids = sorted(set(best_summary.parent_node_ids) | {chunk_node.id})
             await graph.update_node(best_summary)
 
             logger.info(
@@ -672,7 +700,7 @@ class StixDBEngine:
                 threshold=max(threshold, 0.25),
             )
         _, _, broker = await self._ensure_collection(collection)
-        return await broker.ask(
+        response = await broker.ask(
             question=question,
             top_k=top_k,
             search_threshold=threshold,
@@ -682,6 +710,55 @@ class StixDBEngine:
             max_tokens=max_tokens,
             query_origin="user",
         )
+
+        # Persist reasoning as a traversable sub-node when the answer is confident.
+        # This builds a knowledge graph of Q→A→R→sources for future traversal,
+        # so similar future questions can follow reasoning edges to find richer context.
+        if (
+            response.reasoning_trace
+            and response.confidence >= 0.65
+            and response.sources
+        ):
+            try:
+                # Store the answer itself as a node so the reasoning can link to it
+                graph = self._graphs[collection]
+                answer_text = str(response.answer or "").strip()
+                if answer_text and self._is_useful_maintenance_answer(answer_text):
+                    answer_key = self._hash_text(f"answer:{question.strip().lower()}")
+                    # Find or create the answer node
+                    all_facts = await graph.list_nodes(node_type="fact", limit=10000)
+                    answer_node = next(
+                        (n for n in all_facts
+                         if (n.metadata or {}).get("answer_key") == answer_key),
+                        None,
+                    )
+                    if answer_node is None:
+                        answer_node = await graph.add_node(
+                            content=answer_text,
+                            node_type=NodeType.FACT,
+                            tier=MemoryTier.EPISODIC,
+                            importance=min(0.9, 0.5 + response.confidence * 0.4),
+                            source="agent-answer",
+                            tags=["user-query", "answer"],
+                            metadata={
+                                "answer_key": answer_key,
+                                "question": question,
+                                "confidence": response.confidence,
+                            },
+                        )
+                    await self._upsert_reasoning_subnode(
+                        collection=collection,
+                        parent_node_id=answer_node.id,
+                        reasoning_trace=response.reasoning_trace,
+                        source_node_ids=[s.node_id for s in response.sources[:8]],
+                        question=question,
+                        label=f"Q: {question[:80]}",
+                        confidence=response.confidence,
+                    )
+            except Exception as exc:
+                logger.debug("Failed to persist user query reasoning subgraph", error=str(exc))
+
+        return response
 
     async def retrieve(
         self,
@@ -779,12 +856,35 @@ class StixDBEngine:
                 enable_reflection_cache=False,
                 query_origin="maintenance",
             )
-            await self._upsert_maintenance_summary(
+            answer = str(response.answer or "").strip()
+            # Skip storing if the LLM returned nothing useful — an empty or
+            # error-phrase answer produces a node that actively misleads retrieval.
+            if not self._is_useful_maintenance_answer(answer):
+                logger.debug(
+                    "Skipping maintenance summary — answer is empty or low-quality",
+                    collection=collection,
+                    label=plan.summary_label,
+                    answer_preview=answer[:80],
+                )
+                continue
+            summary_node_id = await self._upsert_maintenance_summary(
                 collection=collection,
                 plan=plan,
-                answer=str(response.answer),
+                answer=answer,
+                reasoning_trace=response.reasoning_trace,
                 source_node_ids=[source.node_id for source in response.sources[:8]],
             )
+            # Store the reasoning trace as a linked sub-node for graph traversal
+            if summary_node_id and response.reasoning_trace:
+                await self._upsert_reasoning_subnode(
+                    collection=collection,
+                    parent_node_id=summary_node_id,
+                    reasoning_trace=response.reasoning_trace,
+                    source_node_ids=[source.node_id for source in response.sources[:8]],
+                    question=plan.question,
+                    label=plan.summary_label,
+                    confidence=response.confidence,
+                )
             updated += 1
 
         self._maintenance_fingerprints[collection] = fingerprint
@@ -794,13 +894,51 @@ class StixDBEngine:
             "reasons": [plan.reason for plan in plans],
         }
 
+    _MAINTENANCE_GARBAGE_PHRASES = (
+        "returned an empty response",
+        "no answer",
+        "no relevant",
+        "i don't have",
+        "i do not have",
+        "cannot answer",
+        "not enough information",
+        "no information",
+        "unable to",
+        "i couldn't find",
+        "i could not find",
+    )
+
+    def _is_useful_maintenance_answer(self, answer: str) -> bool:
+        """
+        Return True only if the answer is worth storing as a maintenance node.
+
+        Rejects:
+        - Blank / whitespace-only strings
+        - Very short answers (< 30 chars) — too thin to be useful
+        - Answers that are raw JSON fragments (truncated LLM output)
+        - Common LLM error phrases (empty context, no info, etc.)
+        """
+        if not answer or len(answer) < 30:
+            return False
+        stripped = answer.strip()
+        # Raw JSON / dict responses — LLM returned structured data instead of prose
+        if stripped.startswith("{") or stripped.startswith("["):
+            return False
+        lower = stripped.lower()
+        for phrase in self._MAINTENANCE_GARBAGE_PHRASES:
+            if phrase in lower:
+                return False
+        return True
+
     async def _upsert_maintenance_summary(
         self,
         collection: str,
         plan: MaintenanceQuestion,
         answer: str,
         source_node_ids: list[str],
-    ) -> None:
+        reasoning_trace: str = "",
+    ) -> Optional[str]:
+        """Returns the node ID of the created/updated summary node."""
         graph = self._graphs[collection]
         question_key = plan.question_key
         support_node_ids = await self._select_summary_support_nodes(
@@ -817,6 +955,22 @@ class StixDBEngine:
                 and node.source == "agent-maintenance"
             ),
             None,
+        )
+        connection_entries = build_connection_entries(
+            support_node_ids,
+            relation_type=RelationType.SUMMARIZES,
+            role="support",
+            weight=1.0,
+            source="agent-maintenance",
+        )
+        connection_entries.extend(
+            build_connection_entries(
+                plan.focus_node_ids,
+                relation_type=RelationType.REFERENCES,
+                role="focus",
+                weight=0.8,
+                source="agent-maintenance",
+            )
         )
         metadata = {
             "question": plan.question,
@@ -839,10 +993,19 @@ class StixDBEngine:
                 tier=MemoryTier.SEMANTIC,
                 importance=0.7,
                 source="agent-maintenance",
+                parent_node_ids=support_node_ids,
                 tags=["maintenance", "collection-profile"],
                 metadata=metadata,
                 pinned=False,
             )
+            summary_node.metadata["connection_index"] = build_summary_connection_index(
+                summary_id=summary_node.id,
+                summary_kind=plan.kind,
+                source="agent-maintenance",
+                content_hash=self._hash_text(content),
+                entries=connection_entries,
+            )
+            await graph._storage.upsert_node(summary_node)
             await self._refresh_summary_links(graph, summary_node.id, support_node_ids)
             get_tracer().record_maintenance_summary_refresh(
                 collection=collection,
@@ -851,10 +1014,17 @@ class StixDBEngine:
                 refreshed=False,
                 planner_reason=plan.reason,
             )
-            return
+            return summary_node.id
 
         existing.content = content
         existing.metadata.update(metadata)
+        existing.metadata["connection_index"] = build_summary_connection_index(
+            summary_id=existing.id,
+            summary_kind=plan.kind,
+            source="agent-maintenance",
+            content_hash=self._hash_text(content),
+            entries=connection_entries,
+        )
         existing.importance = max(existing.importance, 0.7)
         existing.tier = MemoryTier.SEMANTIC
         existing.parent_node_ids = support_node_ids
@@ -868,6 +1038,7 @@ class StixDBEngine:
             refreshed=True,
             planner_reason=plan.reason,
         )
+        return existing.id
 
     async def _select_summary_support_nodes(
         self,
@@ -893,6 +1064,114 @@ class StixDBEngine:
             if len(selected) >= limit:
                 break
         return selected
+
+    async def _upsert_reasoning_subnode(
+        self,
+        collection: str,
+        parent_node_id: str,
+        reasoning_trace: str,
+        source_node_ids: list[str],
+        question: str,
+        label: str,
+        confidence: float = 0.7,
+    ) -> Optional[str]:
+        """
+        Create or update a REASONING sub-node linked to a parent answer node.
+
+        Graph structure built:
+          parent_node  --[INFERRED_FROM]-->  reasoning_node
+          reasoning_node  --[INFERRED_FROM]-->  source_node  (×N)
+
+        This makes the reasoning chain traversable: starting from any source
+        node, following INFERRED_FROM edges (reversed) reaches the reasoning
+        that used it, then the answer that was derived from that reasoning.
+
+        Returns the reasoning node ID, or None if storage was skipped.
+        """
+        if not reasoning_trace or not reasoning_trace.strip():
+            return None
+        graph = self._graphs.get(collection)
+        if graph is None:
+            return None
+
+        # Stable key — same question always reuses the same reasoning node
+        import hashlib as _hashlib
+        reasoning_key = _hashlib.sha1(
+            f"reasoning:{question.strip().lower()}".encode()
+        ).hexdigest()
+
+        # Check if a reasoning node already exists for this question
+        existing_reasoning: Optional[object] = None
+        all_fact_nodes = await graph.list_nodes(node_type="fact", limit=10000)
+        for node in all_fact_nodes:
+            if (node.metadata or {}).get("reasoning_key") == reasoning_key:
+                existing_reasoning = node
+                break
+
+        reasoning_content = f"[REASONING] {label}\n\n{reasoning_trace.strip()}"
+        metadata = {
+            "reasoning_key": reasoning_key,
+            "question": question,
+            "parent_node_id": parent_node_id,
+            "source_node_ids": source_node_ids,
+            "confidence": confidence,
+        }
+
+        if existing_reasoning is None:
+            reasoning_node = await graph.add_node(
+                content=reasoning_content,
+                node_type=NodeType.FACT,
+                tier=MemoryTier.SEMANTIC,
+                importance=0.55,
+                source="agent-reasoning",
+                tags=["reasoning-trace", "traversal"],
+                metadata=metadata,
+            )
+            reasoning_node_id = reasoning_node.id
+        else:
+            existing_reasoning.content = reasoning_content
+            existing_reasoning.metadata.update(metadata)
+            await graph.update_node(existing_reasoning)
+            reasoning_node_id = existing_reasoning.id
+
+        # parent_node --[INFERRED_FROM]--> reasoning_node
+        # (answer was inferred by following this reasoning)
+        existing_out = await graph.get_edges(parent_node_id, direction="out")
+        already_linked = any(
+            e.target_id == reasoning_node_id
+            and e.relation_type == RelationType.INFERRED_FROM
+            for e in existing_out
+        )
+        if not already_linked:
+            await graph.add_edge(
+                source_id=parent_node_id,
+                target_id=reasoning_node_id,
+                relation_type=RelationType.INFERRED_FROM,
+                weight=confidence,
+                confidence=confidence,
+                created_by="agent",
+                metadata={"kind": "answer_reasoning_provenance"},
+            )
+
+        # reasoning_node --[INFERRED_FROM]--> each source_node
+        # (reasoning was derived from these source nodes)
+        existing_reasoning_out = await graph.get_edges(reasoning_node_id, direction="out")
+        already_sourced = {e.target_id for e in existing_reasoning_out
+                          if e.relation_type == RelationType.INFERRED_FROM}
+        for i, src_id in enumerate(source_node_ids[:8]):
+            if src_id in already_sourced:
+                continue
+            await graph.add_edge(
+                source_id=reasoning_node_id,
+                target_id=src_id,
+                relation_type=RelationType.INFERRED_FROM,
+                weight=max(0.6, 1.0 - i * 0.05),
+                confidence=confidence,
+                created_by="agent",
+                metadata={"kind": "reasoning_source", "source_rank": i + 1},
+            )
+
+        return reasoning_node_id
 
     async def _refresh_summary_links(
         self,
@@ -1465,6 +1744,43 @@ class StixDBEngine:
             "remaining": len(nodes) - deleted,
             "dry_run": dry_run,
         }
+
+    async def compact_storage(self) -> dict:
+        """
+        Rebuild the KuzuDB file from scratch to reclaim wasted disk space.
+
+        KuzuDB pre-allocates buffer-pool-sized pages on first use (default:
+        ~80 % of system RAM), which bloats the on-disk file to gigabytes even
+        for tiny datasets.  This method:
+          1. Stops all agents (they hold open connections).
+          2. Calls KuzuBackend.compact() which exports data, recreates the
+             file with a controlled 256 MB pool, and reimports everything.
+          3. Restarts the agents.
+
+        Safe to run at any time.  Returns a size-delta summary.
+        """
+        from stixdb.storage.kuzu_backend import KuzuBackend
+
+        self._assert_started()
+        if not isinstance(self._storage_backend, KuzuBackend):
+            return {"error": "Storage compact is only supported for KuzuDB backends."}
+
+        # Stop agents — they hold DB connections via their graphs
+        for agent in list(self._agents.values()):
+            await agent.stop()
+        self._agents.clear()
+
+        try:
+            result = await self._storage_backend.compact()
+        finally:
+            # Restart agents for all currently-loaded collections
+            for collection in list(self._graphs.keys()):
+                graph = self._graphs[collection]
+                agent = self._build_agent(collection, graph)
+                self._agents[collection] = agent
+                await agent.start()
+
+        return result
 
     def get_traces(
         self,
