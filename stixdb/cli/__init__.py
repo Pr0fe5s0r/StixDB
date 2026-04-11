@@ -34,6 +34,7 @@ Command reference
     stixdb store TEXT               Store a single memory node
     stixdb search QUERY             Semantic search
     stixdb ask QUESTION             Ask the AI reasoning agent
+    stixdb enrich -c COLLECTION     Run LLM enrichment agent (on-demand)
 """
 from __future__ import annotations
 
@@ -54,6 +55,7 @@ from stixdb.cli._api import (
     cmd_search,
     cmd_ask,
     cmd_graph,
+    cmd_enrich,
 )
 from stixdb.cli._server import (
     cmd_init,
@@ -101,6 +103,7 @@ app.command("search")(cmd_search)
 app.command("ask")(cmd_ask)
 app.command("graph")(cmd_graph)
 app.command("compact")(cmd_compact)
+app.command("enrich")(cmd_enrich)
 
 
 if __name__ == "__main__":

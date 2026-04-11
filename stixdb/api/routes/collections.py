@@ -9,6 +9,7 @@ POST   /collections/{name}/nodes/bulk        — bulk store
 POST   /collections/{name}/relations         — add a relation edge
 GET    /collections/{name}/stats             — graph statistics
 DELETE /collections/{name}                   — delete collection data
+POST   /collections/{name}/enrich            — run LLM enrichment agent
 """
 from __future__ import annotations
 
@@ -343,4 +344,86 @@ async def export_graph(
         "count": len(nodes),
         "nodes": [node.to_dict(include_embedding=False) for node in nodes],
         "edges": list(edges_by_id.values()),
+    }
+
+
+# ── enrich ─────────────────────────────────────────────────────────────────── #
+
+class EnrichRequest(BaseModel):
+    batch_size: int = 10
+    dry_run: bool = False
+
+
+@router.post("/{collection}/enrich")
+async def enrich_collection(collection: str, body: EnrichRequest, request: Request):
+    """
+    Run the LLM enrichment agent over a collection.
+
+    Finds cross-type node pairs with no semantic edge and asks the configured
+    LLM to classify the relationship. Writes INFERRED/AMBIGUOUS edges back.
+
+    This is Trigger 3 — on-demand. Triggers 1 (post-ingest) and 2 (background)
+    fire automatically via the worker.
+    """
+    from stixdb.agent.enricher import Enricher, find_cross_type_pairs
+
+    engine: StixDBEngine = request.app.state.engine
+    graph, _, _ = await engine._ensure_collection(collection)
+
+    nodes = await graph.list_nodes(limit=100_000)
+    edges = await graph.list_edges()
+
+    if body.dry_run:
+        pairs = find_cross_type_pairs(nodes, nodes)
+        from stixdb.agent.enricher import filter_unenriched_pairs
+        unenriched = filter_unenriched_pairs(pairs, edges)
+        return {
+            "collection": collection,
+            "dry_run": True,
+            "pairs_found": len(pairs),
+            "pairs_skipped": len(pairs) - len(unenriched),
+            "would_enrich": len(unenriched),
+        }
+
+    enricher = Enricher(
+        config=engine.config.reasoner,
+        collection=collection,
+        batch_size=body.batch_size,
+    )
+
+    result = await enricher.enrich_pairs(
+        find_cross_type_pairs(nodes, nodes),
+        edges,
+    )
+
+    # Persist the new edges
+    for edge in result.edges_created:
+        await graph.store_edge(edge)
+
+    # Build a node lookup for human-readable edge details
+    node_map = {n.id: n for n in nodes}
+    edge_details = []
+    for edge in result.edges_created:
+        src = node_map.get(edge.source_id)
+        tgt = node_map.get(edge.target_id)
+        edge_details.append({
+            "source_type": src.node_type.value if src else "?",
+            "source_content": (src.content[:80] if src else edge.source_id),
+            "relation": edge.relation_type.value,
+            "target_type": tgt.node_type.value if tgt else "?",
+            "target_content": (tgt.content[:80] if tgt else edge.target_id),
+            "confidence": round(edge.confidence, 2),
+            "rationale": edge.rationale or "",
+        })
+
+    return {
+        "collection": collection,
+        "dry_run": False,
+        "edges_created": len(result.edges_created),
+        "pairs_skipped": result.pairs_skipped,
+        "pairs_no_relation": result.pairs_no_relation,
+        "pairs_ambiguous": result.pairs_ambiguous,
+        "llm_calls": result.llm_calls,
+        "errors": result.errors,
+        "edge_details": edge_details,
     }

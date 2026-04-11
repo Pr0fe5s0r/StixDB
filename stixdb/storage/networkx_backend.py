@@ -235,6 +235,9 @@ class NetworkXBackend(StorageBackend):
                 result.append(e)
         return result
 
+    async def list_edges(self, collection: str) -> list[RelationEdge]:
+        return list(self._edges[collection].values())
+
     # ------------------------------------------------------------------ #
     # Clusters                                                             #
     # ------------------------------------------------------------------ #

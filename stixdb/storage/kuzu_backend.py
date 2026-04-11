@@ -252,8 +252,9 @@ class KuzuBackend(StorageBackend):
 
     # KuzuDB default buffer_pool_size is ~80 % of system RAM, which causes
     # the on-disk file to balloon to gigabytes even for tiny datasets.
-    # 256 MB is more than sufficient for normal StixDB workloads.
-    _DEFAULT_BUFFER_POOL_MB = 256
+    # 4 GB handles large StixDB collections without buffer exhaustion.
+    # Override via buffer_pool_mb constructor arg or STIXDB_KUZU_BUFFER_POOL_MB env var.
+    _DEFAULT_BUFFER_POOL_MB = int(os.environ.get("STIXDB_KUZU_BUFFER_POOL_MB", "4096"))
 
     def __init__(
         self,
@@ -363,13 +364,18 @@ class KuzuBackend(StorageBackend):
                 del result
             return rows
         except RuntimeError as exc:
-            if _allow_recovery and self._is_buffer_manager_error(exc) and self._has_recoverable_wal():
+            if _allow_recovery and self._is_buffer_manager_error(exc):
+                # Buffer pool exhaustion can happen with or without a WAL —
+                # a previous query may have left pages pinned. Reopening the
+                # connection releases all pinned pages. Drop the WAL only if
+                # one exists (committed data in kuzu.db is always preserved).
+                has_wal = self._has_recoverable_wal()
                 logger.warning(
-                    "Kuzu query failed with buffer manager error; retrying after WAL reset",
+                    "Kuzu query failed with buffer manager error; reopening connection and retrying",
                     error=str(exc)[:200],
-                    wal_path=self._db_file_path + ".wal",
+                    drop_wal=has_wal,
                 )
-                self._reopen_connection(drop_wal=True)
+                self._reopen_connection(drop_wal=has_wal)
                 return self._exec(query, params, _allow_recovery=False)
             raise
 

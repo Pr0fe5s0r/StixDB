@@ -99,6 +99,13 @@ def _extract_pdf_segments(filepath: str | Path) -> IngestionExtractionResult:
     )
 
 
+CODE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".tsx", ".jsx",
+    ".java", ".c", ".cc", ".cpp", ".h", ".hpp",
+    ".cs", ".go", ".rs",
+}
+
+
 def extract_document_segments(
     source: str | Path | list,
     parser: str = "auto",
@@ -130,5 +137,14 @@ def extract_document_segments(
 
     if path.suffix.lower() == ".pdf":
         return _extract_pdf_segments(path)
+
+    # Python files get a richer structural label so the engine knows AST
+    # extraction is available. The actual AST nodes/edges are produced by
+    # ingestion/code.py — this just marks the file type correctly.
+    if path.suffix.lower() in CODE_EXTENSIONS:
+        result = _extract_text_segments(path)
+        result.filetype = "code"
+        result.parser_used = "text+ast_eligible"
+        return result
 
     return _extract_text_segments(path)

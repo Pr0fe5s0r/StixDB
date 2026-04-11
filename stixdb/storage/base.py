@@ -152,6 +152,19 @@ class StorageBackend(ABC):
         """Return all edges connected to a given node."""
         ...
 
+    async def list_edges(self, collection: str) -> list[RelationEdge]:
+        """Return all edges in a collection. Default: iterate via get_edges_for_node.
+        Backends may override with a more efficient implementation."""
+        nodes = await self.list_nodes(collection, limit=100_000)
+        seen: set[str] = set()
+        edges: list[RelationEdge] = []
+        for node in nodes:
+            for edge in await self.get_edges_for_node(node.id, collection, direction="out"):
+                if edge.id not in seen:
+                    seen.add(edge.id)
+                    edges.append(edge)
+        return edges
+
     # ------------------------------------------------------------------ #
     # Clusters                                                             #
     # ------------------------------------------------------------------ #

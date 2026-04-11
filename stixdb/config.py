@@ -124,7 +124,7 @@ class ReasonerConfig(BaseModel):
     provider: LLMProvider = LLMProvider.OPENAI
     model: str = "gpt-4o"
     temperature: float = 0.2
-    max_tokens: int = 2048
+    max_tokens: int = 4096
     max_context_nodes: int = 20    # Max graph nodes passed to the LLM
     graph_traversal_depth: int = 3  # BFS depth for subgraph expansion
     timeout_seconds: float = 60.0
@@ -149,7 +149,7 @@ class StorageConfig(BaseModel):
     vector_backend: VectorBackend = VectorBackend.QDRANT
     # KuzuDB settings (local dev, no Docker needed)
     kuzu_path: str = "./stixdb_data/kuzu"
-    kuzu_buffer_pool_mb: int = 256
+    kuzu_buffer_pool_mb: int = 4096
     # Qdrant settings (empty host = embedded local path under data_dir/qdrant)
     qdrant_host: str = ""
     qdrant_port: int = 6333
@@ -253,7 +253,7 @@ class LLMFileConfig(BaseModel):
     base_url: Optional[str] = None     # auto-set for nebius/openrouter; required for custom
     # Reasoning / inference parameters
     temperature: float = 0.2
-    max_tokens: int = 2048
+    max_tokens: int = 4096
     max_context_nodes: int = 20        # graph nodes passed as context to the LLM
     graph_traversal_depth: int = 3     # BFS depth for subgraph expansion
     timeout: float = 60.0              # API call timeout in seconds
@@ -272,7 +272,7 @@ class StorageFileConfig(BaseModel):
     """Storage config stored in config.json."""
     mode: str = "kuzu"                  # "kuzu"|"memory"|"neo4j"
     path: str = "./stixdb_data"
-    kuzu_buffer_pool_mb: int = 256
+    kuzu_buffer_pool_mb: int = 4096
     neo4j_uri: Optional[str] = None
     neo4j_user_env: Optional[str] = None
     neo4j_password_env: Optional[str] = None
@@ -588,7 +588,7 @@ class StixDBConfig(BaseModel):
                 provider=provider,
                 model=model,
                 temperature=float(_e("STIXDB_LLM_TEMPERATURE", "0.2")),
-                max_tokens=int(_e("STIXDB_LLM_MAX_TOKENS", "2048")),
+                max_tokens=int(_e("STIXDB_LLM_MAX_TOKENS", "4096")),
                 max_context_nodes=int(_e("STIXDB_LLM_MAX_CONTEXT_NODES", "20")),
                 graph_traversal_depth=int(_e("STIXDB_LLM_GRAPH_TRAVERSAL_DEPTH", "3")),
                 timeout_seconds=float(_e("STIXDB_LLM_TIMEOUT", "60.0")),
@@ -603,7 +603,7 @@ class StixDBConfig(BaseModel):
                 data_dir=data_dir,
                 vector_backend=vector_backend,
                 kuzu_path=_e("STIXDB_KUZU_PATH", os.path.join(data_dir, "kuzu")),
-                kuzu_buffer_pool_mb=int(_e("STIXDB_KUZU_BUFFER_POOL_MB", "256")),
+                kuzu_buffer_pool_mb=int(_e("STIXDB_KUZU_BUFFER_POOL_MB", "4096")),
                 qdrant_host=_e("QDRANT_HOST", ""),
                 qdrant_port=int(_e("QDRANT_PORT", "6333")),
                 chroma_host=os.getenv("CHROMA_HOST") or None,

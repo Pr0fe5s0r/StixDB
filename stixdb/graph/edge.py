@@ -15,6 +15,13 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 
+class EdgeProvenance(str, Enum):
+    """How this edge was established."""
+    EXTRACTED  = "extracted"   # Found directly in source (AST, doc structure, explicit links)
+    INFERRED   = "inferred"    # LLM-reasoned relationship — see confidence field
+    AMBIGUOUS  = "ambiguous"   # Low-confidence inference, flagged for review
+
+
 class RelationType(str, Enum):
     """
     Semantic relationship types between memory nodes.
@@ -56,6 +63,29 @@ class RelationType(str, Enum):
     INFERRED_FROM = "inferred_from"   # Edge created by LLM reasoning
     TAGGED_WITH = "tagged_with"       # Node ↔ concept/tag node
 
+    # ── Pass 1: structural code edges (EXTRACTED) ─────────────────────────
+    CALLS     = "calls"      # function/method invokes another
+    IMPORTS   = "imports"    # module imports another module
+    INHERITS  = "inherits"   # class inherits from another class
+    DEFINES   = "defines"    # module/class defines a function or class
+    MUTATES   = "mutates"    # function mutates state of another node
+
+    # ── Pass 1: structural doc edges (EXTRACTED) ──────────────────────────
+    SECTION_OF = "section_of"  # doc_section belongs to a doc_file
+    LINKS_TO   = "links_to"    # hyperlink or explicit reference between doc nodes
+
+    # ── Pass 2: semantic bridge edges (INFERRED) ──────────────────────────
+    EXPLAINS    = "explains"    # one node clarifies or documents another
+    MOTIVATES   = "motivates"   # one node is the reason another exists
+    DECIDES     = "decides"     # decision node governs implementation node
+    IMPLEMENTS  = "implements"  # code node realises a design/decision node
+    VALIDATES   = "validates"   # test or doc node confirms another node's behaviour
+    ABOUT       = "about"       # cross-media anchor: any node references a concept node
+    SUPERSEDES  = "supersedes"  # this node replaces a previous node
+
+    # ── Session edges ─────────────────────────────────────────────────────
+    CHAT = "chat"  # links nodes created or discussed within the same conversation session
+
 
 class RelationEdge(BaseModel):
     """
@@ -78,6 +108,14 @@ class RelationEdge(BaseModel):
     confidence: float = Field(
         default=1.0, ge=0.0, le=1.0,
         description="How confident the agent/system is in this relation."
+    )
+    provenance: EdgeProvenance = Field(
+        default=EdgeProvenance.EXTRACTED,
+        description="How this edge was established: extracted from source, inferred by LLM, or ambiguous."
+    )
+    rationale: Optional[str] = Field(
+        default=None,
+        description="LLM-provided explanation for INFERRED edges. None for EXTRACTED edges."
     )
 
     created_at: float = Field(default_factory=time.time)

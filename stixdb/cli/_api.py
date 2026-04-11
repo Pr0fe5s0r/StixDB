@@ -972,8 +972,12 @@ def cmd_ask(
     ))
 
     if answer:
+        # If the answer came back as a dict/list (LLM ignored the string rule), format it.
+        if isinstance(answer, (dict, list)):
+            import json as _json
+            answer = _json.dumps(answer, indent=2, ensure_ascii=False)
         console.print(Panel(
-            escape(answer),
+            escape(str(answer)),
             title="[bold green]Answer[/bold green]",
             border_style="green",
             padding=(1, 2),
@@ -1292,3 +1296,114 @@ def cmd_graph(
         server.serve_forever()
     except KeyboardInterrupt:
         console.print("\n  Viewer stopped.")
+
+
+# ── enrich ─────────────────────────────────────────────────────────────────────
+
+def cmd_enrich(
+    collection: Optional[str] = typer.Option(None, "--collection", "-c", help="Collection to enrich."),
+    host: str = typer.Option("localhost", help="Server host."),
+    port: int = typer.Option(0, help="Server port."),
+    batch_size: int = typer.Option(10, "--batch-size", "-b", help="Node pairs per LLM call."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show how many pairs would be enriched without calling the LLM."),
+):
+    """
+    [bold]Run the LLM enrichment agent[/bold] over a collection.
+
+    Finds cross-type node pairs with no semantic edge and asks the LLM
+    to classify the relationship between them. Writes INFERRED edges back.
+
+    This is Trigger 3 — the manual on-demand re-run. Triggers 1 and 2
+    fire automatically after ingest and during background cycles.
+
+    Examples:
+      stixdb enrich -c proj_myapp
+      stixdb enrich -c proj_myapp --batch-size 20
+      stixdb enrich -c proj_myapp --dry-run
+    """
+    base_url, api_key = _conn(host, port)
+    coll = collection or default_collection()
+
+    payload: dict = {"batch_size": batch_size, "dry_run": dry_run}
+
+    with Progress(SpinnerColumn(), TextColumn("{task.description}"), transient=True) as progress:
+        progress.add_task(
+            f"[cyan]{'Scanning' if dry_run else 'Enriching'} collection [bold]{coll}[/bold]...",
+            total=None,
+        )
+        data = http_post(f"{base_url}/collections/{coll}/enrich", payload, api_key, timeout=600)
+
+    if not data:
+        console.print("[red]  Enrichment failed — is the server running?[/red]")
+        raise typer.Exit(1)
+
+    edges_created = data.get("edges_created", 0)
+    pairs_skipped = data.get("pairs_skipped", 0)
+    pairs_no_relation = data.get("pairs_no_relation", 0)
+    pairs_ambiguous = data.get("pairs_ambiguous", 0)
+    llm_calls = data.get("llm_calls", 0)
+    errors = data.get("errors", [])
+
+    table = Table(box=box.ROUNDED, show_header=False, padding=(0, 2))
+    table.add_column(style="dim")
+    table.add_column(style="bold")
+    if dry_run:
+        table.add_row("Pairs found", str(data.get("pairs_found", 0)))
+        table.add_row("Already annotated", str(pairs_skipped))
+        table.add_row("Would enrich", str(data.get("pairs_found", 0) - pairs_skipped))
+    else:
+        table.add_row("Edges created", str(edges_created))
+        table.add_row("Ambiguous edges", str(pairs_ambiguous))
+        table.add_row("No relation found", str(pairs_no_relation))
+        table.add_row("Pairs skipped", str(pairs_skipped))
+        table.add_row("LLM calls made", str(llm_calls))
+
+    console.print(
+        Panel(
+            table,
+            title=f"[bold cyan]{'Dry run' if dry_run else 'Enrichment'} — {coll}[/bold cyan]",
+            border_style="cyan",
+            padding=(1, 2),
+        )
+    )
+
+    if not dry_run:
+        edge_details = data.get("edge_details", [])
+        if edge_details:
+            edge_table = Table(
+                box=box.SIMPLE,
+                show_header=True,
+                padding=(0, 1),
+                header_style="bold cyan",
+            )
+            edge_table.add_column("Source", style="green", max_width=40, no_wrap=True)
+            edge_table.add_column("Relation", style="bold yellow", max_width=14)
+            edge_table.add_column("Target", style="blue", max_width=40, no_wrap=True)
+            edge_table.add_column("Conf", justify="right", style="dim", max_width=5)
+            for ed in edge_details:
+                src_label = f"[dim]{ed['source_type']}[/dim] {ed['source_content']}"
+                tgt_label = f"[dim]{ed['target_type']}[/dim] {ed['target_content']}"
+                edge_table.add_row(
+                    src_label,
+                    ed["relation"],
+                    tgt_label,
+                    str(ed["confidence"]),
+                )
+            console.print()
+            console.print(
+                Panel(
+                    edge_table,
+                    title="[bold cyan]Edges created[/bold cyan]",
+                    border_style="dim",
+                    padding=(0, 1),
+                )
+            )
+        elif edges_created == 0:
+            console.print("\n  [dim]No new edges — all pairs already annotated or no relation found.[/dim]")
+
+    if errors:
+        console.print(f"\n  [yellow]Errors ({len(errors)}):[/yellow]")
+        for err in errors[:5]:
+            console.print(f"  [dim]  • {err}[/dim]")
+        if len(errors) > 5:
+            console.print(f"  [dim]  ... and {len(errors) - 5} more[/dim]")

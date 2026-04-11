@@ -238,6 +238,16 @@ class MemoryGraph:
         await self._storage.upsert_edge(edge)
         return edge
 
+    async def store_edge(self, edge: RelationEdge) -> RelationEdge:
+        """Store a fully-constructed RelationEdge directly, preserving all fields
+        (including provenance and rationale set by the AST extractor or Enricher)."""
+        await self._storage.upsert_edge(edge)
+        return edge
+
+    async def list_edges(self) -> list[RelationEdge]:
+        """Return all edges in this collection."""
+        return await self._storage.list_edges(self.collection)
+
     async def delete_edge(self, edge_id: str) -> bool:
         return await self._storage.delete_edge(edge_id, self.collection)
 

@@ -92,8 +92,11 @@ RULES:
 9. Speak naturally to the user.
 10. Produce a structured JSON response with keys:
    - "reasoning": step-by-step explanation of how you derived the answer, naming specific identifiers
-   - "answer": complete, specific answer that names exact class names, config keys, paths, and values
-     from the sources — no vague paraphrases (leave blank if information is truly insufficient)
+   - "answer": a PLAIN STRING — the complete, specific answer written in natural language.
+     Name exact class names, config keys, paths, and values from the sources.
+     NEVER use a nested JSON object or array as the value of "answer".
+     The answer must be a single string that can be printed directly to the user.
+     Leave blank only if information is truly insufficient.
    - "used_node_ids": list of source IDs that were most relevant
    - "confidence": float 0-1 indicating your confidence in the answer
    - "status": "complete" OR "incomplete" (set to "incomplete" if you need more information)
@@ -862,14 +865,21 @@ class Reasoner:
         try:
             data = json.loads(raw)
             status = data.get("status", "complete")
-            
+
             answer = data.get("answer")
             if answer is None or (isinstance(answer, str) and not answer.strip()):
-                # Fallback to raw if logic dictates, but avoid literal "{}"
-                if raw.strip() == "{}":
-                    answer = "The model produced an empty structured result."
-                else:
+                # Empty answer means the LLM found no relevant information — keep it empty
+                # so callers can detect "no answer" cleanly. Only fall back to raw if the
+                # response wasn't structured at all (i.e. no "status" key present).
+                if "status" not in data and raw.strip() != "{}":
                     answer = raw
+                else:
+                    answer = ""
+
+            # LLM sometimes returns answer as a nested object despite the prompt rule.
+            # Convert to readable text so the user doesn't see raw JSON.
+            if isinstance(answer, (dict, list)):
+                answer = json.dumps(answer, indent=2, ensure_ascii=False)
 
             return ReasoningResult(
                 answer=_normalize_user_facing_text(str(answer)),
@@ -883,7 +893,30 @@ class Reasoner:
             )
         except (json.JSONDecodeError, ValueError):
             import re
-            
+
+            # Response is invalid JSON (most likely truncated at max_tokens).
+            # Attempt to extract the "answer" string field before it was cut off.
+            salvaged_answer: Optional[str] = None
+            salvaged_reasoning: Optional[str] = None
+            # Match string-valued answer field: "answer": "..."
+            str_answer_m = re.search(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)"', raw, re.DOTALL)
+            if str_answer_m:
+                salvaged_answer = str_answer_m.group(1).replace('\\"', '"').replace("\\n", "\n")
+            # Match reasoning field regardless
+            str_reasoning_m = re.search(r'"reasoning"\s*:\s*"((?:[^"\\]|\\.)*)"', raw, re.DOTALL)
+            if str_reasoning_m:
+                salvaged_reasoning = str_reasoning_m.group(1).replace('\\"', '"').replace("\\n", "\n")
+
+            if salvaged_answer:
+                return ReasoningResult(
+                    answer=_normalize_user_facing_text(salvaged_answer),
+                    reasoning_trace=_normalize_user_facing_text(salvaged_reasoning or "Partial response — JSON was truncated."),
+                    used_node_ids=[n.id for n in nodes[:5]],
+                    confidence=0.5,
+                    model_used=self.config.model,
+                    latency_ms=latency_ms,
+                )
+
             # Try parsing XML-like stream format
             r_match = re.search(r"<reasoning>(.*?)</reasoning>", raw, re.DOTALL)
             s_match = re.search(r"<status>(.*?)</status>", raw, re.DOTALL)

@@ -286,6 +286,50 @@ The cycle processes a capped batch of 64 nodes — CPU cost stays flat regardles
 
 ---
 
+## How the Graph Evolves
+
+StixDB graphs are not static. They grow, cluster, and self-organise over time as the background agent continuously processes your memory collection. Here is what that progression looks like in the graph viewer:
+
+### Stage 1 — Raw Ingestion
+
+<p align="center">
+  <img src="assets/evole_1.png" alt="Stage 1: Raw ingestion — isolated episodic nodes" width="800" />
+</p>
+
+Immediately after ingesting documents, the graph is a flat cloud of **green (episodic) fact nodes** with no connections. Every chunk lives in isolation — the agent has not yet had a chance to analyse relationships.
+
+---
+
+### Stage 2 — First Edges Form
+
+<p align="center">
+  <img src="assets/evole_2.png" alt="Stage 2: First edges form between similar nodes" width="800" />
+</p>
+
+After the first background cycle, the agent detects nodes with high semantic similarity and draws the **first edges**. Small connected clusters begin to appear inside the larger cloud. The rest of the graph remains isolated, waiting to be processed in future cycles.
+
+---
+
+### Stage 3 — Clusters & Working-Memory Hubs
+
+<p align="center">
+  <img src="assets/evole_4.png" alt="Stage 3: Clusters form with working-memory summary hubs" width="800" />
+</p>
+
+As cycles continue, related facts are merged into **orange (working-memory) summary nodes** that act as hubs. Episodic facts radiate outward in clear hub-and-spoke clusters, organised by topic. The graph now has meaningful topology — querying a hub retrieves an entire topic in one hop.
+
+---
+
+### Stage 4 — Semantic Consolidation
+
+<p align="center">
+  <img src="assets/evole_5.png" alt="Stage 4: Semantic long-term memory nodes emerge" width="800" />
+</p>
+
+Over longer periods, frequently accessed and consolidated working-memory nodes graduate into **blue (semantic) long-term memory** nodes. These represent durable, high-confidence knowledge. The graph is now a multi-tier structure: isolated facts at the edges, topic clusters in the middle, and stable semantic anchors at the core.
+
+---
+
 ---
 
 ## For Developers

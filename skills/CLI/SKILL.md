@@ -13,29 +13,124 @@ compatibility: Requires stixdb installed (`pip install stixdb-engine`), Python 3
 
 # StixDB CLI Memory Skill
 
-> **This skill is mandatory.** You MUST run StixDB memory operations at the start of every response
-> (to load context) and at the end of every response (to save what was learned or done). StixDB is
+> **This skill is mandatory.** You MUST run StixDB memory operations at the start of sessions
+> (to load context) and at the end of sessions (to save what was learned or done). StixDB is
 > your primary memory. Your context window is temporary. StixDB is permanent.
 
 ---
 
 ## The Non-Negotiable Rule
 
-**Every single agent interaction follows this structure — no exceptions:**
+**Every session follows this structure:**
 
 ```
-[START OF RESPONSE]
+[SESSION START — when any load trigger fires]
   1. Query StixDB for relevant context
   2. Read the results — this is your ground truth
   3. Answer / act using that context
 
-[END OF RESPONSE]
+[SESSION END — after the last tool call, before closing]
   4. Store everything learned, decided, or changed into StixDB
   5. Update session state so the next session can continue seamlessly
 ```
 
-If you skip step 1, you are answering blind — ignoring everything that happened before this conversation.
+If you skip step 1, you are answering blind — ignoring everything that happened before this session.
 If you skip step 4, everything you just learned is lost the moment this session ends.
+
+---
+
+## CRITICAL: What Query to Run — Direct Task vs Orientation
+
+This is the most common failure point. When a user gives you a **specific task**, the query must name that task. Running the generic 4-question orientation instead is the failure mode — it returns project-wide noise, not the context you actually need.
+
+**Decision rule:**
+
+| What the user says | Query type to run |
+|---|---|
+| "Add a DPA/AVV page", "Fix the login bug", "Make X editable" | **Task-specific** — name the exact task |
+| "Recap", "What's the state?", "Pick up where we left off", "What should I work on?" | **Orientation** — generic 4-question query |
+
+**Task-specific query (use this for direct task requests):**
+
+```bash
+# macOS / Linux
+stixdb ask "What context do I need to [paste the exact task here]? \
+  What decisions apply, what was previously fixed in this area, \
+  what patterns must I follow, and what files are relevant?" \
+  -c proj_$(basename $(pwd)) --top-k 15 --depth 3
+
+# Windows PowerShell
+stixdb ask "What context do I need to [paste the exact task here]? What decisions apply, what was previously fixed in this area, what patterns must I follow, and what files are relevant?" -c "proj_$((Get-Location).Name)" --top-k 15 --depth 3
+```
+
+**Wrong vs right — concrete examples:**
+
+| Task received | Wrong (generic) query | Right (task-specific) query |
+|---|---|---|
+| "Add a DPA/AVV page" | "what is the current state of the project" | "What context do I need to add a DPA/AVV page?" |
+| "Fix auth token refresh" | "what tasks are in progress" | "What context do I need to fix auth token refresh?" |
+| "Add dark mode to dashboard" | "what decisions were made recently" | "What context do I need to add dark mode to the dashboard?" |
+
+The generic query returns project-wide state that doesn't help with your specific task. The task-specific query returns relevant files, decisions, and patterns — so you don't need to read files manually to discover what StixDB already knows.
+
+> **The test:** If you find yourself reading files to orient yourself after running the stixdb query, the query was wrong. Re-run it with the actual task name.
+
+---
+
+## When to Load — Explicit Trigger Conditions
+
+**The "load at the start of every response" rule fails in practice.** For direct task requests
+("fix this error", "make this editable"), reading 2–3 files gives full context faster than a
+stixdb query — and I will skip the load step without realizing it.
+
+**Load stixdb when any of these conditions are true:**
+
+| Condition | Why |
+|---|---|
+| User says "pick up where we left off" | Explicit continuity signal |
+| User says "recap first", "what do you remember", "check stixdb" | Explicit memory request |
+| User says "continue from last time" / "what's the state of" | Session bridging |
+| Task involves a decision, rejected alternative, or failed attempt | Not derivable from code |
+| Task spans more than ~5 files or modules | File reading is no longer faster |
+| User mentions something that happened in a prior session | Memory is the only source |
+| First message in a new Claude Code session on an established project | Default load |
+
+**When file reading is faster and sufficient (skip stixdb load):**
+- Small project (< ~10 files), first or second task of a fresh session
+- Task is fully self-contained in 1–3 files you're about to read anyway
+- No prior-session context is needed to complete the task
+
+> **Rule:** If you are unsure, load. The cost of a missed load is compounded re-investigation.
+> The cost of an unnecessary load is one extra bash command.
+
+---
+
+## Reliable Load: Use a Hook (Recommended)
+
+The load step should not depend on me deciding to fire it. The reliable fix is a hook in
+`settings.json` that auto-runs before every session:
+
+```json
+// ~/.claude/settings.json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "stixdb daemon start --quiet 2>/dev/null; stixdb search \"in progress\" -c proj_$(basename $(pwd)) --top-k 5 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+This ensures `in-progress` state is always visible at session start, regardless of how the
+user phrases their first message. Pair with a `UserPromptSubmit` hook if you want full orientation.
 
 ---
 
@@ -44,11 +139,40 @@ If you skip step 4, everything you just learned is lost the moment this session 
 StixDB's CLI works identically on all platforms. Only the **shell syntax for setting variables**
 and **line continuation characters** differ. Identify your OS once, use the right block everywhere.
 
+### Step 0 — Resolve the real collection name (do this FIRST, every session)
+
+`proj_$(basename $(pwd))` is a guess. Directory names use underscores; collections may use hyphens or differ entirely. **Always verify before querying.**
+
+```bash
+# macOS / Linux — list collections and find the one for this project
+stixdb collections list
+
+# Pick the collection whose name matches this project directory.
+# Example: directory is "weisscam_dashboard" but collection is "proj_weisscam-dashboard"
+COLL="proj_weisscam-dashboard"   # ← use the ACTUAL name from the list output
+```
+
+```powershell
+# Windows PowerShell — same rule
+stixdb collections list
+# Then set COLL to the actual name shown in the list:
+$COLL = "proj_weisscam-dashboard"   # ← actual name, not a guess
+```
+
+```cmd
+:: Windows CMD
+stixdb collections list
+set COLL=proj_weisscam-dashboard
+```
+
+> **Rule:** Never hardcode `proj_$(basename $(pwd))` and assume it matches. Always run `stixdb collections list` first, read the output, and set `COLL` to the exact name that appears there.
+
+---
+
 ### macOS / Linux — bash or zsh
 
 ```bash
-# Set once at the start of every session
-COLL="proj_$(basename $(pwd))"
+# After resolving the collection name above:
 DATE=$(date +%Y-%m-%d)
 
 # Use in commands
@@ -62,8 +186,7 @@ LINE TWO" -c $COLL
 ### Windows — PowerShell (recommended for Windows)
 
 ```powershell
-# Set once at the start of every session
-$COLL = "proj_$((Get-Location).Name)"
+# After resolving the collection name above:
 $DATE = Get-Date -Format "yyyy-MM-dd"
 
 # Use in commands
@@ -77,8 +200,7 @@ LINE TWO" -c $COLL
 ### Windows — Command Prompt (CMD)
 
 ```cmd
-:: Set once at the start of every session
-for %I in (.) do set COLL=proj_%~nxI
+:: After resolving the collection name above:
 set DATE=%date:~10,4%-%date:~4,2%-%date:~7,2%
 
 :: Use in commands  (note: %COLL% not $COLL)
@@ -598,12 +720,20 @@ stixdb daemon status        # Verify it's running
 
 Do not open any files or start any work until you have completed this sequence.
 
+> **STOP — which situation are you in?**
+> - User gave you a **specific task** ("add X", "fix Y", "make Z editable") → skip Steps 1–2, go directly to Step 3 with the task name filled in. The orientation query is irrelevant and will return noise.
+> - User asked for **orientation** ("recap", "what's the state", "pick up where we left off") → run Steps 1–2, then Step 3.
+
 **macOS / Linux:**
 ```bash
 stixdb daemon start
-COLL="proj_$(basename $(pwd))"
+# Resolve the real collection name — never assume basename matches
+stixdb collections list
+COLL="<paste the exact name from the list above>"  # e.g. proj_weisscam-dashboard
 
-# Step 1 — Full structured orientation (NEVER ask generically — always ask in sub-questions)
+# Step 1 — Full structured orientation
+# ⚠️  Only run this for ORIENTATION requests. For direct task requests ("add X", "fix Y"),
+#     skip to Step 3 and fill in the actual task name.
 stixdb ask "I am starting a new session on this project. \
   Answer each of these specifically: \
   (1) What tasks are currently in progress — list each with its exact next action. \
@@ -617,18 +747,21 @@ stixdb search "in progress" -c $COLL --top-k 5
 stixdb search "known issues blockers" -c $COLL --top-k 5
 stixdb search "user preferences" -c $COLL --top-k 3
 
-# Step 3 — Once you know your task, ask a focused question about THAT specific area
-# Replace [task area] with the actual module or feature you are about to touch
-stixdb ask "I am about to work on [task area]. \
+# Step 3 — Task-specific query (ALWAYS run this — this is the most important step)
+# For direct task requests: this is the ONLY query you need. Skip Steps 1–2.
+# Replace [exact task] with what the user actually asked you to do.
+stixdb ask "What context do I need to [exact task]? \
   What decisions apply here, what bugs were previously fixed in this area, \
-  and what patterns must I follow?" \
+  what patterns must I follow, and what files are relevant?" \
   -c $COLL --top-k 20 --depth 3
 ```
 
 **Windows (PowerShell):**
 ```powershell
 stixdb daemon start
-$COLL = "proj_$((Get-Location).Name)"
+# Resolve the real collection name
+stixdb collections list
+$COLL = "<paste the exact name from the list above>"  # e.g. "proj_weisscam-dashboard"
 
 # Step 1 — Full structured orientation
 stixdb ask "I am starting a new session on this project. Answer each of these specifically: (1) What tasks are currently in progress — list each with its exact next action. (2) What decisions were made in recent sessions that I must not contradict? (3) Are there any known bugs, blockers, or unresolved issues? (4) What should I work on first, and why?" -c $COLL --top-k 25 --depth 3 --thinking 2 --hops 4
@@ -638,23 +771,28 @@ stixdb search "in progress" -c $COLL --top-k 5
 stixdb search "known issues blockers" -c $COLL --top-k 5
 stixdb search "user preferences" -c $COLL --top-k 3
 
-# Step 3 — Focused question about your specific task area
-stixdb ask "I am about to work on [task area]. What decisions apply here, what bugs were fixed in this area before, and what patterns must I follow?" -c $COLL --top-k 20 --depth 3
+# Step 3 — Task-specific query (ALWAYS run this — skip Steps 1–2 for direct task requests)
+stixdb ask "What context do I need to [exact task]? What decisions apply here, what bugs were fixed in this area before, what patterns must I follow, and what files are relevant?" -c $COLL --top-k 20 --depth 3
 ```
 
 **Windows (CMD):**
 ```cmd
 stixdb daemon start
-for %I in (.) do set COLL=proj_%~nxI
+:: Resolve the real collection name
+stixdb collections list
+set COLL=<paste the exact name from the list above>
 
+:: Step 1+2 — only for orientation requests, skip for direct task requests
 stixdb ask "I am starting a new session. What tasks are in progress with their next actions? What recent decisions must I not contradict? Any known bugs or blockers? What should I start with?" -c %COLL% --top-k 25 --depth 3 --thinking 2 --hops 4
 stixdb search "in progress" -c %COLL% --top-k 5
 stixdb search "known issues blockers" -c %COLL% --top-k 5
 stixdb search "user preferences" -c %COLL% --top-k 3
-stixdb ask "I am about to work on [task area]. What decisions apply, what bugs were fixed here, what patterns must I follow?" -c %COLL% --top-k 20 --depth 3
+:: Step 3 — always run this with the actual task filled in
+stixdb ask "What context do I need to [exact task]? What decisions apply, what bugs were fixed here, what patterns must I follow, what files are relevant?" -c %COLL% --top-k 20 --depth 3
 ```
 
 > Read results carefully at Step 3 — if you see two conflicting entries, the one with `SUPERSEDES:` wins.
+> **If you find yourself reading files to orient after Step 3, the query was too generic. Re-run it with the exact task name.**
 
 ---
 

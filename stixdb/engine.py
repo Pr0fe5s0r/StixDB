@@ -55,6 +55,8 @@ from stixdb.storage.vector_store import build_vector_store
 from stixdb.storage.embeddings import build_embedding_client
 from stixdb.backup import build_backup_store
 from stixdb.ingestion import extract_document_segments, is_supported_text_file
+from stixdb.ingestion.code import extract_code_graph
+from stixdb.ingestion.documents import CODE_EXTENSIONS
 from stixdb.agent.maintenance import MaintenancePlanner, MaintenanceQuestion
 from stixdb.agent.memory_agent import MemoryAgent
 from stixdb.agent.reasoner import Reasoner, ReasoningResult
@@ -420,10 +422,14 @@ class StixDBEngine:
         # ── Step 2: Build content-hash set for cross-source dedup guard ───────
         # Prevents identical chunk text from being stored twice even from
         # different source paths (e.g. copied files).
+        # Exclude stale nodes — they were just deleted and their hashes must
+        # not block re-ingestion of the same source file.
+        stale_ids = {n.id for n in stale} if source_name else set()
         existing_content_hashes = {
             (node.metadata or {}).get("content_hash")
             for node in existing_nodes
             if (node.metadata or {}).get("content_hash")
+            and node.id not in stale_ids
         }
 
         ingested_at = time.time()
@@ -478,6 +484,173 @@ class StixDBEngine:
 
         nodes = await graph.bulk_add_nodes(items)
         await self._sync_chunks_with_summaries(graph, nodes)
+
+        # ── Pass 1: AST extraction for code files ──────────────────────────
+        # Runs after text chunks so both representations exist in the graph.
+        # Produces typed structural nodes (FUNCTION, CLASS, MODULE) and
+        # EXTRACTED edges (CALLS, IMPORTS, INHERITS, DEFINES) — zero LLM.
+        if (
+            not _is_docs
+            and Path(filepath).suffix.lower() == ".py"
+        ):
+            ast_result = extract_code_graph(filepath, collection, source_name=source_name or "")
+            if ast_result.nodes and not ast_result.parse_errors:
+                # External MODULE stubs (import targets like "Module: openai")
+                # are structural markers only. Storing them with embeddings
+                # pollutes semantic search — they rank for any query mentioning
+                # the library name but contain no useful content. Skip them.
+                external_ids: set[str] = {
+                    n.id for n in ast_result.nodes
+                    if n.metadata.get("external")
+                }
+                ast_node_dicts = [
+                    {
+                        "node_id": n.id,
+                        "content": n.content,
+                        "node_type": n.node_type.value,
+                        "tier": "episodic",
+                        "importance": n.importance,
+                        "source": source_name,
+                        "tags": (tags or []) + ["ast", "pass1"],
+                        "metadata": {**n.metadata, "ast_extracted": True},
+                        "pinned": False,
+                    }
+                    for n in ast_result.nodes
+                    if n.id not in external_ids
+                ]
+                ast_nodes = await graph.bulk_add_nodes(ast_node_dicts)
+                for edge in ast_result.edges:
+                    # Skip edges whose target is an external stub (dangling)
+                    if edge.target_id not in external_ids:
+                        await graph.store_edge(edge)
+
+                # ── Connect text chunks -> AST nodes by range overlap ───────
+                # Problem: lineno is the FIRST line of a function/class.
+                # A chunk covering the function BODY has char_start > that
+                # line's char offset, so a point-in-range check misses it.
+                # Fix: use range intersection.
+                #   chunk overlaps node  iff  node_start < chunk_end
+                #                             AND node_end >= chunk_start
+                # MODULE (non-external) covers the whole file -> links to ALL
+                # chunks from this file.
+                try:
+                    source_text = Path(filepath).read_text(encoding="utf-8", errors="ignore")
+                    # cumulative[i] = char offset of the START of line i (1-based)
+                    cumulative = [0]
+                    for line in source_text.splitlines(keepends=True):
+                        cumulative.append(cumulative[-1] + len(line))
+                    total_chars = cumulative[-1]
+
+                    # Build map: ast_node_id -> (start_char, end_char)
+                    from stixdb.graph.node import NodeType as _NT
+                    node_range_map: dict[str, tuple[int, int]] = {}
+                    for orig in ast_result.nodes:
+                        meta = orig.metadata or {}
+                        if meta.get("external"):
+                            continue  # skip imported external modules
+                        lineno = meta.get("lineno")
+                        if lineno is not None:
+                            start_char = cumulative[lineno - 1] if lineno - 1 < len(cumulative) else 0
+                            end_lineno = meta.get("end_lineno")
+                            if end_lineno is not None and end_lineno < len(cumulative):
+                                end_char = cumulative[end_lineno]
+                            else:
+                                end_char = total_chars  # unknown end -> cover to EOF
+                            node_range_map[orig.id] = (start_char, end_char)
+                        elif orig.node_type in (_NT.MODULE, _NT.CODE_FILE) and not meta.get("external"):
+                            # file-level nodes cover the whole file
+                            node_range_map[orig.id] = (0, total_chars)
+
+                    from stixdb.graph.edge import RelationEdge, RelationType, EdgeProvenance
+                    chunk_edge_count = 0
+                    for chunk_node in nodes:  # text chunks only
+                        char_start = (chunk_node.metadata or {}).get("char_start")
+                        char_end   = (chunk_node.metadata or {}).get("char_end")
+                        if char_start is None or char_end is None:
+                            continue
+                        for ast_node in ast_nodes:
+                            node_range = node_range_map.get(ast_node.id)
+                            if node_range is None:
+                                continue
+                            node_start, node_end = node_range
+                            # Range intersection: node and chunk overlap
+                            if node_start < char_end and node_end > char_start:
+                                edge = RelationEdge(
+                                    collection=collection,
+                                    source_id=chunk_node.id,
+                                    target_id=ast_node.id,
+                                    relation_type=RelationType.SECTION_OF,
+                                    weight=1.0,
+                                    confidence=1.0,
+                                    provenance=EdgeProvenance.EXTRACTED,
+                                    created_by="chunk_linker",
+                                )
+                                await graph.store_edge(edge)
+                                chunk_edge_count += 1
+                    logger.info(
+                        "Chunk->AST linking complete",
+                        chunk_edges=chunk_edge_count,
+                        collection=collection,
+                    )
+                except Exception as exc:
+                    logger.warning("Chunk->AST linking failed", error=str(exc))
+
+                logger.info(
+                    "AST extraction complete",
+                    file=source_name,
+                    ast_nodes=len(ast_nodes),
+                    ast_edges=len(ast_result.edges),
+                    collection=collection,
+                )
+                nodes = nodes + ast_nodes
+
+        # ── Structural hub for non-Python code files ───────────────────────
+        # TS/TSX/JS/JSX etc. can't go through the Python AST extractor, but
+        # they still need a CODE_FILE node so their chunks aren't isolated.
+        # Every text chunk gets a SECTION_OF edge pointing to this hub.
+        elif (
+            not _is_docs
+            and Path(filepath).suffix.lower() in CODE_EXTENSIONS
+            and nodes
+        ):
+            from stixdb.graph.node import NodeType as _NT
+            from stixdb.graph.edge import RelationEdge, RelationType, EdgeProvenance
+
+            display = source_name or Path(filepath).name
+            [file_node] = await graph.bulk_add_nodes([{
+                "content": f"Code file: {display}",
+                "node_type": _NT.CODE_FILE.value,
+                "tier": "episodic",
+                "importance": 0.3,
+                "source": source_name,
+                "tags": (tags or []) + ["code_file"],
+                "metadata": {
+                    "path": filepath,
+                    "filename": display,
+                    "suffix": Path(filepath).suffix,
+                    "ast_extracted": False,
+                },
+                "pinned": False,
+            }])
+            for chunk_node in nodes:
+                await graph.store_edge(RelationEdge(
+                    collection=collection,
+                    source_id=chunk_node.id,
+                    target_id=file_node.id,
+                    relation_type=RelationType.SECTION_OF,
+                    weight=1.0,
+                    confidence=1.0,
+                    provenance=EdgeProvenance.EXTRACTED,
+                    created_by="file_linker",
+                ))
+            nodes = nodes + [file_node]
+            logger.info(
+                "Code file hub created",
+                file=display,
+                chunks_linked=len(nodes) - 1,
+                collection=collection,
+            )
+
         return [n.id for n in nodes]
 
     async def _sync_chunks_with_summaries(
@@ -488,7 +661,7 @@ class StixDBEngine:
         """
         After ingestion, link each new chunk to the most semantically similar
         existing SUMMARY node (if any). When a match is found:
-          - A DERIVED_FROM edge is added (summary → chunk) so the summary
+          - A DERIVED_FROM edge is added (summary -> chunk) so the summary
             is aware of this new piece of evidence.
           - The summary's embedding is updated to the normalised centroid of
             its old embedding and the chunk's embedding.
@@ -712,7 +885,7 @@ class StixDBEngine:
         )
 
         # Persist reasoning as a traversable sub-node when the answer is confident.
-        # This builds a knowledge graph of Q→A→R→sources for future traversal,
+        # This builds a knowledge graph of Q->A->R->sources for future traversal,
         # so similar future questions can follow reasoning edges to find richer context.
         if (
             response.reasoning_trace
@@ -1677,7 +1850,7 @@ class StixDBEngine:
         to_delete: set[str] = set()
 
         # ── Pass 1: source-version dedup ─────────────────────────────────────
-        # Group by source → document_hash → [nodes]
+        # Group by source -> document_hash -> [nodes]
         by_source: dict[str, dict[str, list]] = {}
         for node in nodes:
             src = node.source
@@ -1705,7 +1878,7 @@ class StixDBEngine:
 
         # ── Pass 2: content-hash dedup ────────────────────────────────────────
         # Among nodes not already marked for deletion, deduplicate identical text
-        seen_content: dict[str, object] = {}  # content_hash → winning node
+        seen_content: dict[str, object] = {}  # content_hash -> winning node
         content_dupes = 0
         for node in nodes:
             if node.id in to_delete:

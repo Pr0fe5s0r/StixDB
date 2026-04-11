@@ -22,10 +22,24 @@ class NodeType(str, Enum):
     FACT = "fact"               # Objective statement about the world
     ENTITY = "entity"           # A person, place, org, thing
     EVENT = "event"             # Something that happened at a point in time
-    CONCEPT = "concept"         # An abstract idea or category
+    CONCEPT = "concept"         # An abstract idea or category — cross-media anchor for ABOUT edges
     PROCEDURE = "procedure"     # A how-to or step sequence
     SUMMARY = "summary"         # Auto-generated summary of merged nodes
     QUESTION = "question"       # An open query posed by an external agent
+
+    # ── Code nodes (Pass 1 AST extraction) ───────────────────────────────
+    CODE_FILE = "code_file"     # A source file on disk
+    MODULE    = "module"        # A Python module (logical unit within a file)
+    FUNCTION  = "function"      # A function or method definition
+    CLASS     = "class"         # A class definition
+
+    # ── Document nodes ────────────────────────────────────────────────────
+    DOC_FILE    = "doc_file"    # A document file (.md, .pdf, .txt, etc.)
+    DOC_SECTION = "doc_section" # A section or chunk within a document
+
+    # ── Decision / session nodes ──────────────────────────────────────────
+    DECISION     = "decision"     # A recorded architectural or design decision
+    CONVERSATION = "conversation" # A session or dialogue — anchor for CHAT edges
 
 
 class MemoryTier(str, Enum):
