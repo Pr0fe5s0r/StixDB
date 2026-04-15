@@ -326,6 +326,7 @@ class StixDBEngine:
         )
 
         get_tracer().record_node_stored(collection, node.id, content[:80])
+        self._schedule_enrichment(collection, graph, [node])
         return node.id
 
     async def bulk_store(
@@ -336,12 +337,13 @@ class StixDBEngine:
         """
         Store multiple memories in a single batched operation.
         More efficient than calling store() in a loop.
-        
+
         Each item is a dict matching the store() kwargs.
         """
         self._assert_started()
         graph, _, _ = await self._ensure_collection(collection)
         nodes = await graph.bulk_add_nodes(items)
+        self._schedule_enrichment(collection, graph, nodes)
         return [n.id for n in nodes]
 
     async def ingest_file(
@@ -651,7 +653,70 @@ class StixDBEngine:
                 collection=collection,
             )
 
+        self._schedule_enrichment(collection, graph, nodes)
         return [n.id for n in nodes]
+
+    def _schedule_enrichment(self, collection: str, graph, new_nodes: list) -> None:
+        """
+        Fire-and-forget post-ingest enrichment.
+
+        Spawns an asyncio background task that runs the LLM enricher over the
+        newly added nodes.  The task is non-blocking — store/ingest/bulk_store
+        return immediately and enrichment runs concurrently.
+
+        Guards:
+        - Skips if no LLM is configured (provider == NONE).
+        - Skips if new_nodes is empty.
+        - Skips if none of the new nodes are bridge candidates (cross-type
+          enrichment only fires when code ↔ non-code pairs exist).
+        """
+        from stixdb.config import LLMProvider
+        if self.config.reasoner.provider == LLMProvider.NONE:
+            return
+        if not new_nodes:
+            return
+
+        async def _run():
+            try:
+                from stixdb.agent.enricher import Enricher, find_cross_type_pairs, filter_unenriched_pairs
+                existing_nodes = await graph.list_nodes(limit=100_000)
+                existing_edges = await graph.list_edges()
+                pairs = find_cross_type_pairs(new_nodes, existing_nodes)
+                if not pairs:
+                    return
+                unenriched = filter_unenriched_pairs(pairs, existing_edges)
+                if not unenriched:
+                    return
+                logger.info(
+                    "Post-ingest enrichment: %d pairs to enrich",
+                    len(unenriched),
+                    collection=collection,
+                )
+                enricher = Enricher(
+                    config=self.config.reasoner,
+                    collection=collection,
+                )
+                result = await enricher.enrich_pairs(unenriched, existing_edges)
+                for edge in result.edges_created:
+                    await graph.store_edge(edge)
+                logger.info(
+                    "Post-ingest enrichment complete: %d edges created",
+                    len(result.edges_created),
+                    collection=collection,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Post-ingest enrichment failed (non-fatal): %s", exc,
+                    collection=collection,
+                )
+
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(_run())
+        except RuntimeError:
+            pass  # no event loop — enrichment skipped (e.g. sync test context)
 
     async def _sync_chunks_with_summaries(
         self,
