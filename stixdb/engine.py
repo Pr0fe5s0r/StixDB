@@ -938,17 +938,19 @@ class StixDBEngine:
         collection: str,
         query: str,
         top_k: int = 10,
-        threshold: float = 0.25,
+        threshold: float = 0.1,
         depth: int = 1,
+        mode: str = "hybrid",
     ) -> list[dict]:
         """
         Raw retrieval without LLM reasoning.
         Returns a list of serialised node dicts with scores.
+        mode: "hybrid" (keyword + semantic, default) | "keyword" (no embedding API call) | "semantic" (vector only)
         """
         self._assert_started()
         _, _, broker = await self._ensure_collection(collection)
         candidates = await broker.retrieve_only(
-            query=query, top_k=top_k, threshold=threshold, depth=depth
+            query=query, top_k=top_k, threshold=threshold, depth=depth, mode=mode
         )
         return [
             {**node.to_dict(include_embedding=False), "score": score}

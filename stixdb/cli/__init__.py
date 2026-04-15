@@ -53,6 +53,7 @@ from stixdb.cli._api import (
     cmd_ingest,
     cmd_store,
     cmd_search,
+    cmd_keywords,
     cmd_ask,
     cmd_graph,
     cmd_enrich,
@@ -100,6 +101,7 @@ app.command("info")(cmd_info)
 app.command("ingest")(cmd_ingest)
 app.command("store")(cmd_store)
 app.command("search")(cmd_search)
+app.command("keywords")(cmd_keywords)
 app.command("ask")(cmd_ask)
 app.command("graph")(cmd_graph)
 app.command("compact")(cmd_compact)

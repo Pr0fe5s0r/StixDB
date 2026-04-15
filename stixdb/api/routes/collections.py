@@ -13,11 +13,13 @@ POST   /collections/{name}/enrich            — run LLM enrichment agent
 """
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Optional, AsyncIterator
+import json
 import os
 import tempfile
 
 from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from stixdb.engine import StixDBEngine
@@ -426,4 +428,139 @@ async def enrich_collection(collection: str, body: EnrichRequest, request: Reque
         "llm_calls": result.llm_calls,
         "errors": result.errors,
         "edge_details": edge_details,
+    }
+
+
+@router.post("/{collection}/enrich/stream")
+async def enrich_collection_stream(collection: str, body: EnrichRequest, request: Request):
+    """
+    SSE streaming variant of /enrich.
+
+    Yields progress events as each batch completes so the CLI can show a live
+    progress bar without waiting for the full run to finish.
+
+    Event types:
+        {"type": "start",  "total_pairs": N, "total_batches": N, "pairs_skipped": N}
+        {"type": "batch",  "batch": N, "total_batches": N, "edges_this_batch": N,
+                           "edges_so_far": N, "no_relation": N, "ambiguous": N}
+        {"type": "done",   "edges_created": N, "pairs_skipped": N,
+                           "pairs_no_relation": N, "pairs_ambiguous": N,
+                           "llm_calls": N, "errors": [...], "edge_details": [...]}
+    """
+    from stixdb.agent.enricher import Enricher, find_cross_type_pairs, filter_unenriched_pairs
+
+    engine: StixDBEngine = request.app.state.engine
+    graph, _, _ = await engine._ensure_collection(collection)
+
+    nodes = await graph.list_nodes(limit=100_000)
+    edges = await graph.list_edges()
+
+    if body.dry_run:
+        pairs = find_cross_type_pairs(nodes, nodes)
+        unenriched = filter_unenriched_pairs(pairs, edges)
+        payload = json.dumps({
+            "type": "done",
+            "dry_run": True,
+            "pairs_found": len(pairs),
+            "pairs_skipped": len(pairs) - len(unenriched),
+            "would_enrich": len(unenriched),
+        })
+        return StreamingResponse(
+            iter([f"data: {payload}\n\n", "data: [DONE]\n\n"]),
+            media_type="text/event-stream",
+        )
+
+    enricher = Enricher(
+        config=engine.config.reasoner,
+        collection=collection,
+        batch_size=body.batch_size,
+    )
+    node_map = {n.id: n for n in nodes}
+
+    async def event_generator() -> AsyncIterator[str]:
+        async for event in enricher.enrich_pairs_stream(
+            find_cross_type_pairs(nodes, nodes),
+            edges,
+        ):
+            if event["type"] == "done":
+                # Persist edges and build edge_details before sending
+                created_edges = event.pop("edges_created", [])
+                for edge in created_edges:
+                    await graph.store_edge(edge)
+
+                edge_details = []
+                for edge in created_edges:
+                    src = node_map.get(edge.source_id)
+                    tgt = node_map.get(edge.target_id)
+                    edge_details.append({
+                        "source_type": src.node_type.value if src else "?",
+                        "source_content": (src.content[:80] if src else edge.source_id),
+                        "relation": edge.relation_type.value,
+                        "target_type": tgt.node_type.value if tgt else "?",
+                        "target_content": (tgt.content[:80] if tgt else edge.target_id),
+                        "confidence": round(edge.confidence, 2),
+                        "rationale": edge.rationale or "",
+                    })
+                event["edges_created"] = len(created_edges)
+                event["edge_details"] = edge_details
+
+            yield f"data: {json.dumps(event)}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/{collection}/keywords")
+async def get_collection_keywords(collection: str, request: Request):
+    """
+    Return keyword vocabulary for a collection.
+
+    Lists all unique tags (sorted by frequency) and the top content terms
+    derived from node text. Agents can use this to construct precise keyword
+    queries against the collection without embedding API calls.
+    """
+    import re
+    from collections import Counter
+
+    _STOPWORDS = {
+        "the", "and", "for", "are", "was", "were", "that", "this", "with",
+        "from", "have", "has", "had", "but", "not", "you", "all", "can",
+        "will", "its", "our", "also", "been", "they", "than", "then",
+        "when", "what", "into", "more", "their", "which", "about", "would",
+    }
+
+    engine: StixDBEngine = request.app.state.engine
+    graph, _, _ = await engine._ensure_collection(collection)
+
+    nodes = await graph.list_nodes(limit=50_000, include_embedding=False)
+
+    tag_counter: Counter = Counter()
+    term_doc_freq: Counter = Counter()
+
+    for node in nodes:
+        for tag in node.tags or []:
+            tag_counter[tag.lower()] += 1
+
+        terms = {
+            t for t in re.findall(r"[a-zA-Z0-9_]+", (node.content or "").lower())
+            if len(t) >= 3 and t not in _STOPWORDS
+        }
+        for term in terms:
+            term_doc_freq[term] += 1
+
+    return {
+        "collection": collection,
+        "total_nodes": len(nodes),
+        "tags": [
+            {"tag": tag, "count": count}
+            for tag, count in tag_counter.most_common(300)
+        ],
+        "top_terms": [term for term, _ in term_doc_freq.most_common(150)],
+        "node_types": list({n.node_type.value for n in nodes}),
+        "sources": list({n.source for n in nodes if n.source}),
     }

@@ -465,6 +465,67 @@ class Enricher:
         )
         return result
 
+    async def enrich_pairs_stream(
+        self,
+        pairs: list[NodePair],
+        existing_edges: list[RelationEdge],
+    ):
+        """
+        Like enrich_pairs() but yields a progress dict after each batch so the
+        caller can stream it to a client.  Does NOT persist edges — the caller
+        must do that using the edge objects in the final "done" event.
+
+        Yields dicts:
+            {"type": "start",    "total_pairs": N, "total_batches": N}
+            {"type": "batch",    "batch": N, "total_batches": N,
+             "edges_this_batch": [...], "edges_so_far": N,
+             "no_relation": N, "errors": [...]}
+            {"type": "done",     "edges_created": [...RelationEdge...],
+             "pairs_skipped": N, "pairs_no_relation": N,
+             "pairs_ambiguous": N, "llm_calls": N, "errors": [...]}
+        """
+        result = EnrichmentResult()
+
+        if self.config.provider == LLMProvider.NONE or not pairs:
+            yield {"type": "done", "edges_created": [], "pairs_skipped": 0,
+                   "pairs_no_relation": 0, "pairs_ambiguous": 0, "llm_calls": 0, "errors": []}
+            return
+
+        unenriched = filter_unenriched_pairs(pairs, existing_edges)
+        result.pairs_skipped = len(pairs) - len(unenriched)
+
+        total_batches = max(1, -(-len(unenriched) // self.batch_size))  # ceil
+        yield {"type": "start", "total_pairs": len(unenriched), "total_batches": total_batches,
+               "pairs_skipped": result.pairs_skipped}
+
+        batch_num = 0
+        for batch_start in range(0, len(unenriched), self.batch_size):
+            batch_num += 1
+            batch = unenriched[batch_start : batch_start + self.batch_size]
+            edges_before = len(result.edges_created)
+            await self._process_batch(batch, result)
+            new_edges = result.edges_created[edges_before:]
+            yield {
+                "type": "batch",
+                "batch": batch_num,
+                "total_batches": total_batches,
+                "edges_this_batch": len(new_edges),
+                "edges_so_far": len(result.edges_created),
+                "no_relation": result.pairs_no_relation,
+                "ambiguous": result.pairs_ambiguous,
+                "errors": result.errors[len(result.errors) - (result.llm_calls - batch_num + 1):] if result.errors else [],
+            }
+
+        yield {
+            "type": "done",
+            "edges_created": result.edges_created,
+            "pairs_skipped": result.pairs_skipped,
+            "pairs_no_relation": result.pairs_no_relation,
+            "pairs_ambiguous": result.pairs_ambiguous,
+            "llm_calls": result.llm_calls,
+            "errors": result.errors,
+        }
+
     async def _process_batch(
         self,
         batch: list[NodePair],

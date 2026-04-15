@@ -146,12 +146,14 @@ stixdb store "Decided to use KuzuDB for persistent storage." -c my_project --tag
 
 ### Search
 
-Semantic search — fast, no LLM, returns ranked matches.
+Search a collection. Defaults to **hybrid mode** — keyword scoring combined with vector similarity — for the best recall without extra flags.
 
 ```bash
-stixdb search "auth middleware"                        # search default collection
-stixdb search "database decisions" -c proj_myapp       # search a named collection
+stixdb search "auth middleware"                              # hybrid search (default)
+stixdb search "database decisions" -c proj_myapp             # search a named collection
 stixdb search "in progress" -c proj_myapp --top-k 10
+stixdb search "deploy steps" --mode keyword                  # fast tag/term match, no API call
+stixdb search "latency bottleneck" --mode semantic           # pure vector similarity
 ```
 
 **Options:**
@@ -159,20 +161,31 @@ stixdb search "in progress" -c proj_myapp --top-k 10
 | Option | Default | Description |
 |---|---|---|
 | `-c`, `--collection` | from config | Collection to search |
-| `--top-k` | `10` | Number of results to return |
+| `--top-k` | `5` | Number of results to return |
 | `--depth` | `1` | Graph expansion depth (higher = more context) |
-| `--threshold` | `0.25` | Minimum similarity score (0.0–1.0) |
+| `--threshold` | `0.1` | Minimum combined score (0.0–1.0) |
+| `--mode` | `hybrid` | `hybrid` (keyword + semantic), `keyword` (no API, ~5ms), `semantic` (vector only) |
+
+**Retrieval modes:**
+
+| Mode | How it works | When to use |
+|---|---|---|
+| `hybrid` *(default)* | Keyword scoring (tag + content) + vector similarity, merged `0.7×semantic + 0.3×keyword` | Best general recall |
+| `keyword` | Tag overlap (2× weight) + content term match. No embedding API call. ~5ms | Fast exact-term lookups |
+| `semantic` | Vector embedding + cosine similarity | Paraphrase queries, conceptual matches |
 
 ---
 
 ### Ask
 
-Ask a natural-language question. The agent retrieves relevant memory, reasons over it, and returns a cited answer.
+Ask a natural-language question. The agent retrieves relevant memory using hybrid search, reasons over it with an LLM, and returns a **Perplexity-style answer** — structured Markdown with inline citations `[1]`, `[2]` and a **Sources** section.
 
 ```bash
 stixdb ask "What was I working on last session?"
 stixdb ask "What decisions have been made about storage?" -c proj_myapp
 stixdb ask "Summarize all known bugs" -c proj_myapp --top-k 20 --depth 3
+stixdb ask "Explain the auth flow" --stream                 # stream tokens as they generate
+stixdb ask "Deep dive on our storage layer" --thinking 3    # multi-hop reasoning
 ```
 
 **Options:**
@@ -182,13 +195,16 @@ stixdb ask "Summarize all known bugs" -c proj_myapp --top-k 20 --depth 3
 | `-c`, `--collection` | from config | Collection to query |
 | `--top-k` | `15` | Nodes to retrieve before reasoning |
 | `--depth` | `2` | Graph traversal depth |
-| `--threshold` | `0.25` | Minimum similarity score |
 | `--thinking` | `1` | Reasoning steps (`1` = single-pass, `2+` = multi-hop) |
 | `--hops` | `4` | Retrieval hops per thinking step |
+| `--stream`, `-s` | `false` | Stream answer tokens progressively as they are generated |
+| `--max-tokens` | server default | Cap LLM response length |
 
 **When to use `ask` vs `search`:**
 - Use `search` when you want specific facts back quickly (no LLM cost).
-- Use `ask` when you need the answer synthesised across multiple memories.
+- Use `ask` when you need the answer synthesised and explained across multiple memories.
+
+**Answer format:** `ask` returns rich Markdown — headers, bullet lists, code blocks, inline citations `[1]` `[2]`, and a **Sources** section. Use `--stream` to see tokens arrive in real time rather than waiting for the full response.
 
 ---
 
@@ -368,7 +384,7 @@ POST /collections/{collection}/nodes
 
 ---
 
-#### Semantic search
+#### Search
 
 ```
 POST /search
@@ -378,10 +394,13 @@ POST /search
   "query": "who leads payments",
   "collection": "proj_myapp",
   "top_k": 10,
-  "threshold": 0.25,
-  "depth": 1
+  "threshold": 0.1,
+  "depth": 1,
+  "search_mode": "hybrid"
 }
 ```
+
+`search_mode` accepts `"hybrid"` *(default)*, `"keyword"`, or `"semantic"`.
 
 ---
 
@@ -402,11 +421,32 @@ POST /collections/{collection}/ask
 ```
 ```json
 {
-  "answer": "The team decided to use bcrypt...",
+  "answer": "## Auth Decisions\n\nThe team decided to use bcrypt [1]...\n\n**Sources**\n[1] auth-decisions — ...",
   "sources": [...],
   "confidence": 0.91
 }
 ```
+
+The `answer` field is Markdown with inline citations `[1]`, `[2]` and a **Sources** section.
+
+---
+
+#### Ask — streaming
+
+```
+POST /collections/{collection}/ask/stream
+```
+
+Same request body as `/ask`. Returns a **Server-Sent Events** stream:
+
+```
+data: {"type": "answer", "content": "## Auth"}
+data: {"type": "answer", "content": " Decisions\n\n"}
+...
+data: [DONE]
+```
+
+Each `data:` line is a JSON object with `type` (`"answer"` or `"node_count"`) and `content`. The stream terminates with `data: [DONE]`.
 
 ---
 

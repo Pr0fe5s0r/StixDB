@@ -209,20 +209,34 @@ class ContextBroker:
         self,
         query: str,
         top_k: int = 10,
-        threshold: float = 0.25,
+        threshold: float = 0.1,
         depth: int = 1,
+        mode: str = "hybrid",
     ) -> list[tuple[MemoryNode, float]]:
         """
         Pure retrieval without LLM reasoning.
-        Useful when the calling agent wants to do its own reasoning.
+        mode: "hybrid" (keyword + semantic, default) | "keyword" (no embedding API call) | "semantic" (vector only)
         """
-        candidates = await self.graph.semantic_search_with_graph_expansion(
+        if mode == "keyword":
+            return await self.graph.keyword_search_with_graph_expansion(
+                query=query,
+                top_k=top_k,
+                threshold=threshold,
+                depth=depth,
+            )
+        if mode == "hybrid":
+            return await self.graph.hybrid_search_with_graph_expansion(
+                query=query,
+                top_k=top_k,
+                threshold=threshold,
+                depth=depth,
+            )
+        return await self.graph.semantic_search_with_graph_expansion(
             query=query,
             top_k=top_k,
             threshold=threshold,
             depth=depth,
         )
-        return candidates
 
     # ------------------------------------------------------------------ #
     # Internal helpers                                                     #

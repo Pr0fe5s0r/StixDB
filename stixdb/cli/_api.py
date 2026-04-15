@@ -22,15 +22,16 @@ from typing import Optional
 
 import typer
 from rich.markup import escape
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, MofNCompleteColumn
 from rich import box
 
 from stixdb.cli._helpers import (
     console, server_url, resolved_port, resolved_api_key,
     default_collection, load_global_config,
-    http_get, http_post, http_delete,
+    http_get, http_post, http_delete, http_stream_post,
 )
 
 # ── Collections sub-app ────────────────────────────────────────────────────────
@@ -833,21 +834,26 @@ def cmd_search(
     host: str = typer.Option("localhost", help="Server host."),
     port: int = typer.Option(0, help="Server port."),
     top_k: int = typer.Option(5, "--top-k", "-k", help="Number of results to return."),
-    threshold: float = typer.Option(0.25, help="Minimum similarity score  0.0 – 1.0."),
-    depth: int = typer.Option(0, help="Graph expansion depth (higher = more context, slower)."),
+    threshold: float = typer.Option(0.1, help="Minimum match score  0.0 – 1.0."),
+    depth: int = typer.Option(1, help="Graph expansion depth (higher = more context, slower)."),
     tags: str = typer.Option("", "--tags", "-t", help="Filter results by these tags."),
+    mode: str = typer.Option("hybrid", "--mode", "-m", help="Retrieval mode: hybrid (keyword + semantic, default), keyword (fast, no API), or semantic (vector only)."),
     json_output: bool = typer.Option(False, "--json", help="Output raw JSON instead of formatted results."),
 ):
     """
-    [bold]Semantic search[/bold] across a collection.
+    [bold]Search[/bold] across a collection.
 
-    Finds the most relevant memory nodes for your query using vector
-    similarity plus graph expansion.
+    Defaults to [cyan]hybrid[/cyan] mode — keyword scoring + vector similarity, merged.
+    Use [cyan]--mode keyword[/cyan] for fast tag/term matching (no embedding API call).
+    Use [cyan]--mode semantic[/cyan] for pure vector similarity search.
+
+    Run [cyan]stixdb keywords -c COLLECTION[/cyan] first to see what terms exist.
 
     Examples:
-      stixdb search "who leads the payments team?"
-      stixdb search "security config" -c infra --depth 2 --top-k 10
-      stixdb search "deploy steps" --tags ops --json
+      stixdb search "auth decisions" -c proj_myapp
+      stixdb search "deploy steps" --tags ops --depth 2
+      stixdb search "latency" --mode semantic -c infra
+      stixdb search "in-progress" --mode keyword -c proj_myapp
     """
     base, api_key = _conn(host, port)
     coll = collection or default_collection()
@@ -864,6 +870,7 @@ def cmd_search(
         "include_heatmap": False,
         "include_metadata": False,
         "sort_by": "relevance",
+        "search_mode": mode,
     }
     data = http_post(f"{base}/search", payload, api_key)
 
@@ -907,6 +914,89 @@ def cmd_search(
     console.print()
 
 
+# ── keywords ──────────────────────────────────────────────────────────────────
+
+def cmd_keywords(
+    collection: Optional[str] = typer.Option(None, "--collection", "-c", help="Collection to inspect."),
+    host: str = typer.Option("localhost", help="Server host."),
+    port: int = typer.Option(0, help="Server port."),
+    for_agent: bool = typer.Option(False, "--for-agent", help="Output compact text for pasting into an agent prompt."),
+    json_output: bool = typer.Option(False, "--json", help="Output raw JSON."),
+):
+    """
+    [bold]Show searchable keywords[/bold] for a collection.
+
+    Lists all tags (with counts) and the top content terms found across
+    all nodes. Use this to know exactly what words to pass to
+    [cyan]stixdb search[/cyan] — especially useful for agents that need
+    a vocabulary reference before querying.
+
+    Examples:
+      stixdb keywords -c proj_myapp
+      stixdb keywords -c proj_myapp --for-agent
+    """
+    base, api_key = _conn(host, port)
+    coll = collection or default_collection()
+    data = http_get(f"{base}/collections/{coll}/keywords", api_key)
+
+    if json_output:
+        console.print_json(json.dumps(data))
+        return
+
+    tags = data.get("tags", [])
+    top_terms = data.get("top_terms", [])
+    node_types = data.get("node_types", [])
+    sources = data.get("sources", [])
+    total = data.get("total_nodes", 0)
+
+    if for_agent:
+        lines = [
+            f"StixDB collection: {coll}  ({total} nodes)",
+            "",
+            "Tags (use exactly with --tags or in keyword queries):",
+            "  " + "  ".join(f"{t['tag']}({t['count']})" for t in tags[:80]),
+            "",
+            "Top content terms (use in search queries):",
+            "  " + ", ".join(top_terms[:100]),
+            "",
+            "Node types present:",
+            "  " + ", ".join(node_types),
+        ]
+        if sources:
+            lines += ["", "Sources:", "  " + ", ".join(sources[:20])]
+        console.print("\n".join(lines))
+        return
+
+    console.print()
+    console.print(Panel(
+        f"[bold]{coll}[/bold]  [dim]·  {total} nodes[/dim]",
+        title="Collection Keywords",
+        border_style="cyan",
+        padding=(0, 2),
+    ))
+
+    if tags:
+        t = Table(title="Tags", box=box.SIMPLE, header_style="bold cyan", show_header=True)
+        t.add_column("Tag", style="cyan")
+        t.add_column("Count", justify="right", style="dim")
+        for entry in tags[:60]:
+            t.add_row(entry["tag"], str(entry["count"]))
+        if len(tags) > 60:
+            t.add_row(f"[dim]… and {len(tags) - 60} more[/dim]", "")
+        console.print(t)
+
+    if top_terms:
+        console.print()
+        console.print("[bold]Top content terms:[/bold]")
+        console.print("  " + escape("  ·  ".join(top_terms[:80])))
+
+    if node_types:
+        console.print()
+        console.print(f"[bold]Node types:[/bold]  {', '.join(node_types)}")
+
+    console.print()
+
+
 # ── ask ────────────────────────────────────────────────────────────────────────
 
 def cmd_ask(
@@ -919,6 +1009,7 @@ def cmd_ask(
     thinking: int = typer.Option(1, "--thinking", "-t", help="Thinking steps (>1 enables multi-hop reasoning)."),
     hops: int = typer.Option(4, "--hops", help="Max retrieval hops per thinking step."),
     max_tokens: Optional[int] = typer.Option(None, "--max-tokens", "-m", help="Max tokens for the LLM response. Overrides server default."),
+    stream: bool = typer.Option(False, "--stream", "-s", help="Stream answer tokens progressively as they are generated."),
     json_output: bool = typer.Option(False, "--json", help="Output raw JSON."),
 ):
     """
@@ -927,16 +1018,21 @@ def cmd_ask(
     Retrieves relevant context from the memory graph and synthesises a
     grounded, cited answer using the configured LLM.
 
+    [bold cyan]Streaming Mode:[/bold cyan]
+    Use [cyan]--stream[/cyan] to print answer tokens as they arrive, Perplexity-style.
+
     [bold cyan]Thinking Mode:[/bold cyan]
     Use [cyan]--thinking 2[/cyan] or higher to enable autonomous multi-hop reasoning.
-    The agent will perform multiple retrieval rounds, refine its internal
-    query based on what it finds, and synthesize a deep answer.
 
     Examples:
       stixdb ask "What payment processor do we use?"
+      stixdb ask "Explain the auth flow" --stream
       stixdb ask "Summarise our security posture" -c infra --thinking 3
       stixdb ask "Who owns the auth service?" --json
     """
+    from rich.live import Live
+    from rich.text import Text
+
     base, api_key = _conn(host, port)
     coll = collection or default_collection()
 
@@ -951,6 +1047,46 @@ def cmd_ask(
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
 
+    console.print()
+    console.print(Panel(
+        f"[italic]{escape(question)}[/italic]",
+        title="Question",
+        border_style="dim",
+        padding=(0, 2),
+    ))
+
+    if stream:
+        buffer = ""
+        first_token = True
+        with Live(
+            Text("Retrieving context…", style="dim"),
+            refresh_per_second=15,
+            console=console,
+            vertical_overflow="visible",
+        ) as live:
+            for chunk in http_stream_post(f"{base}/collections/{coll}/ask/stream", payload, api_key):
+                if chunk.get("type") != "answer":
+                    continue
+                token = chunk.get("content", "")
+                if not token:
+                    continue
+                if first_token:
+                    first_token = False
+                buffer += token
+                live.update(Markdown(buffer))
+
+        # Re-render final answer inside a panel once streaming is complete
+        console.print()
+        if buffer:
+            console.print(Panel(
+                Markdown(buffer),
+                title="[bold green]Answer[/bold green]",
+                border_style="green",
+                padding=(1, 2),
+            ))
+        console.print()
+        return
+
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as prog:
         prog.add_task("Thinking…" if thinking > 1 else "Synthesising…")
         data = http_post(f"{base}/collections/{coll}/ask", payload, api_key)
@@ -963,21 +1099,13 @@ def cmd_ask(
     sources   = data.get("sources") or data.get("citations") or []
     reasoning = data.get("reasoning_trace") or data.get("reasoning") or ""
 
-    console.print()
-    console.print(Panel(
-        f"[italic]{question}[/italic]",
-        title="Question",
-        border_style="dim",
-        padding=(0, 2),
-    ))
-
     if answer:
         # If the answer came back as a dict/list (LLM ignored the string rule), format it.
         if isinstance(answer, (dict, list)):
             import json as _json
             answer = _json.dumps(answer, indent=2, ensure_ascii=False)
         console.print(Panel(
-            escape(str(answer)),
+            Markdown(str(answer)),
             title="[bold green]Answer[/bold green]",
             border_style="green",
             padding=(1, 2),
@@ -998,7 +1126,6 @@ def cmd_ask(
         console.print(t)
 
     if reasoning:
-        # Increase the truncation for a better "thinking" preview
         limit = 2000
         preview = reasoning[:limit] + ("…" if len(reasoning) > limit else "")
         console.print(Panel(
@@ -1324,14 +1451,75 @@ def cmd_enrich(
     base_url, api_key = _conn(host, port)
     coll = collection or default_collection()
 
+    # ── Step 1: pre-scan (free — no LLM) so the user knows what's coming ──────
+    if not dry_run:
+        with Progress(SpinnerColumn(), TextColumn("{task.description}"), transient=True) as progress:
+            progress.add_task(f"[dim]Scanning pairs in [bold]{coll}[/bold]...", total=None)
+            scan = http_post(f"{base_url}/collections/{coll}/enrich", {"batch_size": batch_size, "dry_run": True}, api_key, timeout=60)
+
+        if scan:
+            pairs_found   = scan.get("pairs_found", 0)
+            already_done  = scan.get("pairs_skipped", 0)
+            will_enrich   = scan.get("would_enrich", pairs_found - already_done)
+            llm_calls_est = max(1, -(-will_enrich // batch_size))  # ceil division
+            console.print(
+                f"  [dim]Scan:[/dim] [bold]{pairs_found}[/bold] cross-type pairs  "
+                f"[dim]·[/dim]  [bold]{already_done}[/bold] already annotated  "
+                f"[dim]·[/dim]  [bold cyan]{will_enrich}[/bold cyan] to enrich  "
+                f"[dim]·[/dim]  ~[bold]{llm_calls_est}[/bold] LLM call(s) of {batch_size} pairs each"
+            )
+            if will_enrich == 0:
+                console.print("\n  [dim]Nothing to do — all pairs already have semantic edges.[/dim]")
+                return
+            console.print()
+
+    # ── Step 2: run enrichment via SSE stream (or dry-run) ────────────────────
     payload: dict = {"batch_size": batch_size, "dry_run": dry_run}
 
-    with Progress(SpinnerColumn(), TextColumn("{task.description}"), transient=True) as progress:
-        progress.add_task(
-            f"[cyan]{'Scanning' if dry_run else 'Enriching'} collection [bold]{coll}[/bold]...",
-            total=None,
-        )
-        data = http_post(f"{base_url}/collections/{coll}/enrich", payload, api_key, timeout=600)
+    data: dict = {}
+
+    if dry_run:
+        with Progress(SpinnerColumn(), TextColumn("{task.description}"), transient=True) as progress:
+            progress.add_task(f"[cyan]Scanning [bold]{coll}[/bold]...", total=None)
+            data = http_post(f"{base_url}/collections/{coll}/enrich", payload, api_key, timeout=60)
+    else:
+        # Streaming path — Docker-style progress bar
+        _pair_count = will_enrich if (scan) else "?"
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(bar_width=30),
+            MofNCompleteColumn(),
+            TextColumn("·"),
+            TimeElapsedColumn(),
+            TextColumn("·"),
+            TextColumn("[green]{task.fields[edges]}[/green] edges  [dim]{task.fields[status]}[/dim]"),
+            transient=False,
+            console=console,
+        ) as progress:
+            task = progress.add_task(
+                f"enrich {coll}",
+                total=None,
+                edges=0,
+                status="waiting...",
+            )
+            for event in http_stream_post(
+                f"{base_url}/collections/{coll}/enrich/stream", payload, api_key, timeout=600
+            ):
+                etype = event.get("type")
+                if etype == "start":
+                    progress.update(task, total=event.get("total_batches", 1), completed=0)
+                elif etype == "batch":
+                    progress.update(
+                        task,
+                        completed=event.get("batch", 1),
+                        edges=event.get("edges_so_far", 0),
+                        status=f"batch {event.get('batch')}/{event.get('total_batches')}",
+                    )
+                elif etype == "done":
+                    t = progress.tasks[0]
+                    progress.update(task, completed=t.total or 1, status="done")
+                    data = event
 
     if not data:
         console.print("[red]  Enrichment failed — is the server running?[/red]")
@@ -1344,13 +1532,14 @@ def cmd_enrich(
     llm_calls = data.get("llm_calls", 0)
     errors = data.get("errors", [])
 
+    # ── Summary panel ──────────────────────────────────────────────────────────
     table = Table(box=box.ROUNDED, show_header=False, padding=(0, 2))
     table.add_column(style="dim")
     table.add_column(style="bold")
     if dry_run:
         table.add_row("Pairs found", str(data.get("pairs_found", 0)))
         table.add_row("Already annotated", str(pairs_skipped))
-        table.add_row("Would enrich", str(data.get("pairs_found", 0) - pairs_skipped))
+        table.add_row("Would enrich", str(data.get("would_enrich", data.get("pairs_found", 0) - pairs_skipped)))
     else:
         table.add_row("Edges created", str(edges_created))
         table.add_row("Ambiguous edges", str(pairs_ambiguous))
@@ -1367,6 +1556,7 @@ def cmd_enrich(
         )
     )
 
+    # ── Edge detail table with rationale ──────────────────────────────────────
     if not dry_run:
         edge_details = data.get("edge_details", [])
         if edge_details:
@@ -1376,18 +1566,21 @@ def cmd_enrich(
                 padding=(0, 1),
                 header_style="bold cyan",
             )
-            edge_table.add_column("Source", style="green", max_width=40, no_wrap=True)
-            edge_table.add_column("Relation", style="bold yellow", max_width=14)
-            edge_table.add_column("Target", style="blue", max_width=40, no_wrap=True)
-            edge_table.add_column("Conf", justify="right", style="dim", max_width=5)
+            edge_table.add_column("Source", style="green", max_width=35, no_wrap=True)
+            edge_table.add_column("Relation", style="bold yellow", max_width=12)
+            edge_table.add_column("Target", style="blue", max_width=35, no_wrap=True)
+            edge_table.add_column("Conf", justify="right", style="dim", max_width=4)
+            edge_table.add_column("Why", style="dim", max_width=50)
             for ed in edge_details:
                 src_label = f"[dim]{ed['source_type']}[/dim] {ed['source_content']}"
                 tgt_label = f"[dim]{ed['target_type']}[/dim] {ed['target_content']}"
+                rationale  = ed.get("rationale", "") or ""
                 edge_table.add_row(
                     src_label,
                     ed["relation"],
                     tgt_label,
                     str(ed["confidence"]),
+                    rationale[:120],
                 )
             console.print()
             console.print(

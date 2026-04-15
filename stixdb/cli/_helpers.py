@@ -82,6 +82,20 @@ def default_collection() -> str:
 
 
 # ── HTTP helpers ───────────────────────────────────────────────────────────────
+# A single persistent Client is reused across all CLI calls within a process.
+# On Windows, creating a new httpx connection per call adds ~2s TCP overhead;
+# reusing the same client keeps subsequent calls at 3-30ms.
+
+_http_client: Optional["httpx.Client"] = None  # type: ignore[name-defined]
+
+
+def _client() -> "httpx.Client":  # type: ignore[name-defined]
+    global _http_client
+    if _http_client is None:
+        import httpx
+        _http_client = httpx.Client()
+    return _http_client
+
 
 def server_url(host: str, port: int) -> str:
     return f"http://{host}:{port}"
@@ -91,7 +105,7 @@ def http_get(url: str, api_key: Optional[str] = None, timeout: int = 60) -> dict
     import httpx
     headers = {"X-API-Key": api_key} if api_key else {}
     try:
-        r = httpx.get(url, headers=headers, timeout=timeout)
+        r = _client().get(url, headers=headers, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except httpx.ConnectError:
@@ -115,7 +129,7 @@ def http_post(url: str, payload: dict, api_key: Optional[str] = None, timeout: i
         else {"Content-Type": "application/json"}
     )
     try:
-        r = httpx.post(url, json=payload, headers=headers, timeout=timeout)
+        r = _client().post(url, json=payload, headers=headers, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except httpx.ConnectError:
@@ -131,11 +145,49 @@ def http_post(url: str, payload: dict, api_key: Optional[str] = None, timeout: i
         raise typer.Exit(1)
 
 
+def http_stream_post(url: str, payload: dict, api_key: Optional[str] = None, timeout: int = 300):
+    """
+    POST *url* and yield parsed JSON objects from a Server-Sent Events response.
+    Each SSE line is expected to be:  ``data: <json>\\n\\n``
+    The stream ends when a ``data: [DONE]`` sentinel is received.
+    """
+    import httpx
+    import json as _json
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["X-API-Key"] = api_key
+    try:
+        with _client().stream("POST", url, json=payload, headers=headers, timeout=timeout) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                line = line.strip()
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                try:
+                    yield _json.loads(data)
+                except _json.JSONDecodeError:
+                    pass
+    except httpx.ConnectError:
+        console.print(f"[red]✗[/red] Cannot reach server at [bold]{url}[/bold]")
+        console.print("  Start one with [cyan]stixdb serve[/cyan] or [cyan]stixdb daemon start[/cyan].")
+        raise typer.Exit(1)
+    except httpx.ReadTimeout:
+        console.print(f"[red]✗[/red] Server timed out after {timeout}s: [bold]{url}[/bold]")
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        console.print(f"[red]HTTP {exc.response.status_code}:[/red] {exc.response.text}")
+        raise typer.Exit(1)
+
+
 def http_delete(url: str, api_key: Optional[str] = None, timeout: int = 60) -> dict:
     import httpx
     headers = {"X-API-Key": api_key} if api_key else {}
     try:
-        r = httpx.delete(url, headers=headers, timeout=timeout)
+        r = _client().delete(url, headers=headers, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except httpx.ConnectError:

@@ -157,7 +157,8 @@ def _matches_tags(node_tags: list[str], required_tags: list[str]) -> bool:
 
 def _can_use_vector_only_search(body: "SearchRequest") -> bool:
     return (
-        body.depth == 0
+        body.search_mode == "semantic"
+        and body.depth == 0
         and not body.source_filter
         and not body.tag_filter
         and not body.node_type_filter
@@ -292,6 +293,10 @@ class SearchRequest(BaseModel):
         default="relevance",
         description="Sort results by relevance, heat, or hybrid.",
     )
+    search_mode: str = Field(
+        default="hybrid",
+        description="Retrieval mode: 'hybrid' (keyword + semantic, default), 'keyword' (no embedding, fast), or 'semantic' (vector only).",
+    )
 
     @model_validator(mode="after")
     def validate_request(self) -> "SearchRequest":
@@ -310,6 +315,9 @@ class SearchRequest(BaseModel):
         if self.sort_by not in {"relevance", "heat", "hybrid"}:
             raise ValueError("sort_by must be one of: relevance, heat, hybrid.")
 
+        if self.search_mode not in {"keyword", "semantic", "hybrid"}:
+            raise ValueError("search_mode must be 'keyword', 'semantic', or 'hybrid'.")
+
         return self
 
 
@@ -320,6 +328,7 @@ async def _search_collection(
     top_k: int,
     threshold: float,
     depth: int,
+    mode: str = "keyword",
 ) -> list[dict[str, Any]]:
     results = await engine.retrieve(
         collection=collection,
@@ -327,6 +336,7 @@ async def _search_collection(
         top_k=top_k,
         threshold=threshold,
         depth=depth,
+        mode=mode,
     )
     return results
 
@@ -459,6 +469,7 @@ async def search(body: SearchRequest, request: Request):
                     top_k=body.top_k,
                     threshold=body.threshold,
                     depth=body.depth,
+                    mode=body.search_mode,
                 )
                 filtered_results = _filter_and_rank_results(
                     collection=collection,
@@ -509,6 +520,7 @@ async def search(body: SearchRequest, request: Request):
         response["results"] = query_results[0]["results"] if query_results else []
 
     response["search_mode"] = "multi_query" if isinstance(body.query, list) else "single_query"
+    response["retrieval_mode"] = body.search_mode
     response["max_results"] = body.max_results
     response["sort_by"] = body.sort_by
     response["include_heatmap"] = body.include_heatmap or body.sort_by in {"heat", "hybrid"}

@@ -434,10 +434,115 @@ class MemoryGraph:
         1. Semantic search → seed nodes
         2. Summary metadata expansion → direct related nodes
         3. BFS graph expansion → fallback context nodes
-        
+
         Returns union, prioritised by: vector score > graph proximity
         """
         seed_results = await self.semantic_search(query, top_k=top_k, threshold=threshold)
+        return await self._expand_from_seeds(seed_results, top_k=top_k, depth=depth)
+
+    async def keyword_search_with_graph_expansion(
+        self,
+        query: str,
+        top_k: int = 10,
+        threshold: float = 0.1,
+        depth: int = 2,
+    ) -> list[tuple[MemoryNode, float]]:
+        """
+        Keyword-based retrieval — no embedding API call.
+
+        1. Extract query tokens (3+ char words)
+        2. Score nodes by tag overlap (2× weight) + content term overlap
+        3. Take top-k seeds above threshold
+        4. Graph expansion from seeds (identical BFS to semantic path)
+
+        Scans working and semantic tiers first; falls through to episodic
+        if not enough seeds are found.
+        """
+        query_tokens = self._query_terms(query)
+        if not query_tokens:
+            return []
+
+        # Prioritise hot tiers — bounded scan, no embedding needed
+        nodes = await self.list_nodes(tier="working", limit=4096, include_embedding=False)
+        nodes += await self.list_nodes(tier="semantic", limit=2000, include_embedding=False)
+
+        scored = [(n, self._keyword_score(n, query_tokens)) for n in nodes]
+        seeds = [(n, s) for n, s in scored if s >= threshold]
+
+        if len(seeds) < top_k:
+            ep_nodes = await self.list_nodes(tier="episodic", limit=3000, include_embedding=False)
+            seen = {n.id for n, _ in seeds}
+            for node in ep_nodes:
+                if node.id in seen:
+                    continue
+                score = self._keyword_score(node, query_tokens)
+                if score >= threshold:
+                    seeds.append((node, score))
+
+        seeds.sort(key=lambda x: x[1], reverse=True)
+        seed_results = seeds[:top_k]
+        return await self._expand_from_seeds(seed_results, top_k=top_k, depth=depth)
+
+    async def hybrid_search_with_graph_expansion(
+        self,
+        query: str,
+        top_k: int = 10,
+        threshold: float = 0.1,
+        depth: int = 2,
+        semantic_weight: float = 0.7,
+    ) -> list[tuple[MemoryNode, float]]:
+        """
+        Hybrid retrieval: keyword scoring + semantic vector search, scores merged.
+
+        combined = semantic_weight * semantic_score + (1 - semantic_weight) * keyword_score
+
+        Nodes appearing in only one pass still contribute via their single score.
+        No API call cost beyond what semantic_search already requires.
+        """
+        # ── keyword pass (no embedding API call) ─────────────────────────
+        query_tokens = self._query_terms(query)
+        keyword_scores: dict[str, tuple[MemoryNode, float]] = {}
+        if query_tokens:
+            kw_nodes = await self.list_nodes(tier="working", limit=4096, include_embedding=False)
+            kw_nodes += await self.list_nodes(tier="semantic", limit=2000, include_embedding=False)
+            seen_kw = {n.id for n in kw_nodes}
+            ep_nodes = await self.list_nodes(tier="episodic", limit=3000, include_embedding=False)
+            kw_nodes += [n for n in ep_nodes if n.id not in seen_kw]
+            for node in kw_nodes:
+                score = self._keyword_score(node, query_tokens)
+                if score > 0.0:
+                    keyword_scores[node.id] = (node, score)
+
+        # ── semantic pass (vector embedding + cosine similarity) ──────────
+        sem_results = await self.semantic_search(query, top_k=top_k * 3, threshold=0.0)
+        semantic_scores: dict[str, tuple[MemoryNode, float]] = {
+            node.id: (node, score) for node, score in sem_results
+        }
+
+        # ── merge ─────────────────────────────────────────────────────────
+        all_ids = set(keyword_scores) | set(semantic_scores)
+        merged: list[tuple[MemoryNode, float]] = []
+        for nid in all_ids:
+            node = (semantic_scores.get(nid) or keyword_scores[nid])[0]
+            k_score = keyword_scores[nid][1] if nid in keyword_scores else 0.0
+            s_score = semantic_scores[nid][1] if nid in semantic_scores else 0.0
+            combined = semantic_weight * s_score + (1.0 - semantic_weight) * k_score
+            if combined >= threshold:
+                merged.append((node, combined))
+
+        merged.sort(key=lambda x: x[1], reverse=True)
+        return await self._expand_from_seeds(merged[:top_k], top_k=top_k, depth=depth)
+
+    async def _expand_from_seeds(
+        self,
+        seed_results: list[tuple[MemoryNode, float]],
+        top_k: int = 10,
+        depth: int = 2,
+    ) -> list[tuple[MemoryNode, float]]:
+        """
+        Graph expansion from a list of (node, score) seed pairs.
+        Shared by both semantic and keyword retrieval paths.
+        """
         seen_ids: set[str] = {n.id for n, _ in seed_results}
         expanded: list[tuple[MemoryNode, float]] = list(seed_results)
 
@@ -485,7 +590,6 @@ class MemoryGraph:
                 seen_ids.add(node.id)
                 expanded.append((node, summary_related_scores.get(node.id, 0.0)))
 
-            # If a summary's metadata did not hydrate anything, fall back to graph traversal.
             for seed_id, related_ids in summary_seed_related_ids.items():
                 if not any(node_id in returned_ids for node_id in related_ids):
                     fallback_bfs_seed_ids.append(seed_id)
@@ -503,10 +607,8 @@ class MemoryGraph:
                 for nbr in neighbour_map.get(seed_id, []):
                     if nbr.id not in seen_ids:
                         seen_ids.add(nbr.id)
-                        # Discount the neighbour score by depth penalty
                         expanded.append((nbr, seed_score * 0.6))
 
-        # Sort by score descending
         expanded.sort(key=lambda x: x[1], reverse=True)
         return self._dedupe_ranked_nodes(expanded)
 
@@ -679,6 +781,18 @@ class MemoryGraph:
     @staticmethod
     def _query_terms(query: str) -> set[str]:
         return {term for term in re.findall(r"[a-zA-Z0-9_]+", query.lower()) if len(term) >= 3}
+
+    @staticmethod
+    def _keyword_score(node: MemoryNode, query_tokens: set[str]) -> float:
+        """Score a node by keyword overlap. Tag matches are weighted 2× over content matches."""
+        if not query_tokens:
+            return 0.0
+        n = len(query_tokens)
+        node_tags_lower = {t.lower() for t in (node.tags or [])}
+        tag_hits = sum(1 for t in query_tokens if t in node_tags_lower)
+        content_lower = (node.content or "").lower()
+        content_hits = sum(1 for t in query_tokens if t in content_lower)
+        return min(1.0, (tag_hits * 2.0 + content_hits) / n)
 
     @staticmethod
     def _lexical_candidate_score(content: str, query_terms: set[str]) -> float:

@@ -69,52 +69,48 @@ class HopPlan:
 # ──────────────────────────────────────────────────────────────────────────── #
 
 SYSTEM_PROMPT = """\
-You are the internal reasoning agent of StixDB.
-You answer from your own memory while staying grounded in the supporting source excerpts
-available to you for this turn.
+You are a precise, authoritative knowledge assistant. You synthesise answers from source excerpts \
+and present them in rich, readable Markdown — like Perplexity, but grounded strictly in the \
+provided sources.
 
-RULES:
-1. Base your answer ONLY on the supporting source excerpts for this turn — do not hallucinate.
-2. Be SPECIFIC and GROUNDED: use exact class names, function names, configuration keys, file paths,
-   parameter values, and code identifiers that appear in the source excerpts.
-   A good answer says "KuzuBackend (stixdb/storage/kuzu_backend.py), NetworkXBackend (fallback),
-   Neo4jBackend" — not "three storage options". Quote identifiers directly.
-3. Do NOT produce vague paraphrases — the user needs to act on this answer.
-   If the sources name a specific class, config key, or flag: name it in your answer.
-4. Speak as if you are using your own memory. Do NOT frame the answer as something "the collection says",
-   "the database says", or "the memory says".
-5. Do NOT mention internal implementation terms such as "memory nodes", "chunks", "retrieval",
-   "database", "collection", or "context window".
-6. If you need to refer to where information came from, say "the source", "the source text",
-   or the source name if one is provided.
-7. Always cite which source IDs support your answer.
-8. If the information is insufficient, say so explicitly rather than guessing.
-9. Speak naturally to the user.
-10. Produce a structured JSON response with keys:
-   - "reasoning": step-by-step explanation of how you derived the answer, naming specific identifiers
-   - "answer": a PLAIN STRING — the complete, specific answer written in natural language.
-     Name exact class names, config keys, paths, and values from the sources.
-     NEVER use a nested JSON object or array as the value of "answer".
-     The answer must be a single string that can be printed directly to the user.
-     Leave blank only if information is truly insufficient.
-   - "used_node_ids": list of source IDs that were most relevant
-   - "confidence": float 0-1 indicating your confidence in the answer
-   - "status": "complete" OR "incomplete" (set to "incomplete" if you need more information)
-   - "next_query": (optional) if status is "incomplete", provide a search query for the missing pieces
+ANSWER FORMAT — write the "answer" field in Markdown following this structure:
+- Start with a 1–2 sentence direct answer to the question (no header needed).
+- Then use ## headers to break the answer into logical sections where the topic has depth.
+- Use bullet lists, numbered steps, or **bold** emphasis to make information scannable.
+- Use `code formatting` for identifiers, file paths, config keys, function/class names, CLI flags.
+- Use fenced code blocks (```language) for multi-line code or config examples.
+- Inline-cite every claim with a bracketed number like [1], [2] matching the source numbers below.
+- End with a **Sources** section listing each cited source as: `[N] source_name — brief description`.
+- If the information is insufficient, say so clearly and specifically — do not invent.
+
+STRICT RULES:
+1. Ground every statement in the numbered source excerpts. Do not hallucinate.
+2. Quote exact identifiers (class names, flags, paths) from the sources — never paraphrase them.
+3. Do not mention "memory nodes", "chunks", "retrieval", "collection", "context window", or "database".
+4. Do not frame the answer as "the source says" or "the collection says" — speak authoritatively in first person.
+5. The "answer" JSON field MUST be a single Markdown string. Never nest a JSON object inside it.
+
+Return a JSON object with these keys:
+- "reasoning": concise internal reasoning (not shown to user — trace how you derived the answer)
+- "answer": the full Markdown answer as a single string
+- "used_node_ids": list of source IDs you cited
+- "confidence": float 0–1
+- "status": "complete" or "incomplete"
+- "next_query": if incomplete, the search query that would fill the gap
 """
 
 STREAM_SYSTEM_PROMPT = """\
-You are the internal reasoning agent of StixDB.
-You answer from your own memory while staying grounded in the supporting source excerpts
-available to you for this turn.
+You are a precise, authoritative knowledge assistant. You synthesise answers from source excerpts \
+and present them in rich, readable Markdown — like Perplexity, but grounded strictly in the \
+provided sources.
 
-RULES:
-1. Base your answer ONLY on the supporting source excerpts for this turn — do not hallucinate.
-2. Be SPECIFIC: name exact class names, function names, config keys, file paths, and parameter values
-   from the source excerpts. Never paraphrase when you can quote identifiers directly.
-3. Stream the final answer immediately in plain natural language.
-4. Speak as if you are using your own memory. Do NOT say "the collection says", "the database says", or similar.
-5. If the information is insufficient, say so plainly instead of inventing details.
+Write your answer in Markdown:
+- Open with a direct 1–2 sentence answer.
+- Use ## headers, bullet lists, bold, and `code formatting` for identifiers.
+- Inline-cite every claim with [N] matching the numbered sources.
+- End with a **Sources** section: `[N] source_name — one-line description`.
+- Do not mention "memory nodes", "chunks", "retrieval", or "database".
+- If insufficient information, say so — do not invent.
 """
 
 HOP_PLAN_SYSTEM_PROMPT = """\
@@ -143,27 +139,25 @@ def get_system_prompt(custom_prompt: Optional[str] = None, output_schema: Option
         base += f"\n\nCRITICAL: The 'answer' field in your JSON output MUST strictly be an object matching this JSON Schema:\n{json.dumps(output_schema, indent=2)}"
     return base
 
-def build_context_prompt(question: str, nodes: list[MemoryNode]) -> str:
+def build_context_prompt(question: str, nodes: list[MemoryNode], streaming: bool = False) -> str:
     node_context = ""
     for i, node in enumerate(nodes):
         source_name = node.source or node.metadata.get("source") or node.metadata.get("file_path") or "unknown source"
         node_context += (
-            f"\n--- Source Excerpt {i + 1} ---\n"
-            f"Source ID: {node.id}\n"
-            f"Source Name: {source_name}\n"
-            f"Type: {node.node_type.value}\n"
-            f"Tier: {node.tier.value}\n"
-            f"Importance: {node.importance:.2f}\n"
+            f"\n[{i + 1}] {source_name} (id:{node.id})\n"
             f"Excerpt: {node.content}\n"
         )
-        if node.metadata:
-            node_context += f"Metadata: {json.dumps(node.metadata)}\n"
 
+    closing = (
+        "Write your answer in Markdown now. Do NOT wrap in JSON."
+        if streaming else
+        "Write the answer in Markdown following the format rules. Return valid JSON."
+    )
     return (
-        f"QUERY: {question}\n\n"
-        f"AVAILABLE SOURCE EXCERPTS ({len(nodes)} total):\n"
+        f"QUESTION: {question}\n\n"
+        f"SOURCES ({len(nodes)} total) — cite these as [1], [2], … in your answer:\n"
         f"{node_context}\n\n"
-        "Respond strictly following the rules above."
+        f"{closing}"
     )
 
 
@@ -537,7 +531,7 @@ class Reasoner:
         # Prepend system prompt
         messages = [{"role": "system", "content": sp}] + messages
         # Append current context
-        messages.append({"role": "user", "content": build_context_prompt(question, nodes)})
+        messages.append({"role": "user", "content": build_context_prompt(question, nodes, streaming=True)})
 
         if provider == LLMProvider.OPENAI or provider == LLMProvider.CUSTOM:
             api_key = self.config.openai_api_key if provider == LLMProvider.OPENAI else (self.config.custom_api_key or "dummy-key")

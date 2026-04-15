@@ -6,11 +6,13 @@ POST /collections/{name}/retrieve  — raw retrieval without LLM reasoning
 """
 from __future__ import annotations
 
+import json
 from time import perf_counter
+from typing import Any, AsyncIterator, Optional
 
 from fastapi import APIRouter, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import Any, Optional
 
 from stixdb.engine import StixDBEngine
 
@@ -58,6 +60,37 @@ async def ask(collection: str, body: AskRequest, request: Request):
         max_tokens=body.max_tokens,
     )
     return response.to_dict()
+
+
+@router.post("/{collection}/ask/stream")
+async def ask_stream(collection: str, body: AskRequest, request: Request):
+    """
+    Streaming agentic query — same as /ask but streams answer tokens as SSE.
+
+    Each event is:  ``data: {"type": "answer"|"node_count", "content": "..."}``
+    The stream ends with:  ``data: [DONE]``
+    """
+    engine: StixDBEngine = request.app.state.engine
+
+    async def event_generator() -> AsyncIterator[str]:
+        async for chunk in engine.stream_chat(
+            collection=collection,
+            question=body.question,
+            top_k=body.top_k,
+            threshold=body.threshold,
+            depth=body.depth,
+            max_tokens=body.max_tokens,
+        ):
+            if chunk.get("type") == "metadata":
+                continue
+            yield f"data: {json.dumps(chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/{collection}/retrieve")
