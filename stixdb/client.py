@@ -399,7 +399,7 @@ class StixDBEngine:
         """
         data = await self._post(
             f"/collections/{collection}/retrieve",
-            body={"query": query, "top_k": top_k, "threshold": threshold, "depth": depth},
+            body={"query": query, "top_k": top_k, "threshold": threshold, "depth": depth, "mode": mode},
         )
         return data.get("results", [])
 

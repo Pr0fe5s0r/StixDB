@@ -29,9 +29,11 @@ from stixdb.config import (
     IngestionFileConfig,
     LLMFileConfig,
     ObservabilityFileConfig,
+    VLMFileConfig,
     KNOWN_EMBEDDING_DIMENSIONS,
     LLM_MODEL_SUGGESTIONS,
     EMBEDDING_MODEL_SUGGESTIONS,
+    VLM_MODEL_SUGGESTIONS,
     NAMED_LLM_PRESETS,
     NAMED_EMBEDDING_PRESETS,
     ServerFileConfig,
@@ -42,6 +44,7 @@ console = Console()
 
 _LLM_PROVIDERS   = ["openai", "anthropic", "nebius", "openrouter", "ollama", "custom", "none"]
 _EMBED_PROVIDERS = ["local", "openai", "nebius", "openrouter", "ollama", "custom"]
+_VLM_PROVIDERS   = ["openai", "anthropic", "nebius", "openrouter", "ollama", "custom", "none"]
 
 _PROVIDER_LABELS = {
     "openai":     "OpenAI (GPT-4o, o3-mini, …)",
@@ -225,6 +228,71 @@ def _step_embedding(llm_cfg: LLMFileConfig) -> EmbeddingFileConfig:
         provider=provider,
         model=model,
         dimensions=dims,
+        api_key=api_key,
+        base_url=base_url if provider in ("ollama", "custom") else None,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 2b — VLM (optional)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _step_vlm(llm_cfg: LLMFileConfig) -> Optional[VLMFileConfig]:
+    console.print(Panel(
+        "[bold]Step 2b / 5 — Vision Language Model (VLM) [dim](optional)[/dim][/bold]\n"
+        "A VLM describes image files during ingestion so they become searchable.\n"
+        "Skip this step if you don't plan to ingest images.",
+        border_style="cyan", padding=(0, 2),
+    ))
+
+    if not Confirm.ask("  Configure a VLM for image ingestion?", default=False):
+        console.print("  [dim]Skipping — images will be ignored during ingest.[/dim]")
+        return None
+
+    console.print("\n  Available providers:\n")
+    for p in _VLM_PROVIDERS:
+        console.print(f"    [cyan]{p:<12}[/cyan] {_PROVIDER_LABELS.get(p, '')}")
+    console.print()
+
+    default_vlm_provider = llm_cfg.provider if llm_cfg.provider in _VLM_PROVIDERS else "openai"
+    provider = _choose("  Provider", _VLM_PROVIDERS, default=default_vlm_provider)
+
+    if provider == "none":
+        return None
+
+    base_url: Optional[str] = None
+    if provider in NAMED_LLM_PRESETS:
+        base_url = NAMED_LLM_PRESETS[provider]["base_url"]
+        console.print(f"  [dim]Base URL for {provider}: {base_url}[/dim]")
+    elif provider == "ollama":
+        base_url = Prompt.ask("  Ollama base URL", default="http://localhost:11434").strip()
+    elif provider == "custom":
+        base_url = Prompt.ask("  Base URL (required)").strip()
+        if not base_url:
+            console.print("  [red]Base URL is required for custom provider.[/red]")
+            return _step_vlm(llm_cfg)
+
+    api_key: Optional[str] = None
+    if provider not in ("none", "ollama"):
+        if provider == llm_cfg.provider and llm_cfg.api_key:
+            reuse = Confirm.ask("  Reuse same API key as LLM?", default=True)
+            api_key = llm_cfg.api_key if reuse else _key_prompt("API key")
+        else:
+            api_key = _key_prompt("API key")
+
+    _DEFAULT_VLM_MODELS = {
+        "openai":     "gpt-4o-mini",
+        "anthropic":  "claude-sonnet-4-6",
+        "nebius":     "Qwen/Qwen2-VL-72B-Instruct",
+        "openrouter": "openai/gpt-4o",
+        "ollama":     "llava:latest",
+        "custom":     "",
+    }
+    model = _model_prompt(provider, VLM_MODEL_SUGGESTIONS, _DEFAULT_VLM_MODELS)
+
+    return VLMFileConfig(
+        provider=provider,
+        model=model,
         api_key=api_key,
         base_url=base_url if provider in ("ollama", "custom") else None,
     )
@@ -425,6 +493,8 @@ def run_wizard(config_dir: Path) -> ConfigFile:
         console.print()
         emb_cfg                                          = _step_embedding(llm_cfg)
         console.print()
+        vlm_cfg                                          = _step_vlm(llm_cfg)
+        console.print()
         storage_cfg                                      = _step_storage()
         console.print()
         agent_cfg                                        = _step_agent()
@@ -437,6 +507,7 @@ def run_wizard(config_dir: Path) -> ConfigFile:
     cf = ConfigFile(
         llm=llm_cfg,
         embedding=emb_cfg,
+        vlm=vlm_cfg,
         storage=storage_cfg,
         ingestion=ingestion_cfg,
         agent=agent_cfg,

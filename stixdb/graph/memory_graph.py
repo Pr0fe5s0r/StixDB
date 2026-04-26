@@ -101,9 +101,18 @@ class MemoryGraph:
 
         embedding = node.get_embedding_array()
         if embedding is None:
-            embedding = await self._embedding_client.embed_text(node.content)
-            node.set_embedding(embedding)
-            await self._storage.upsert_node(node)
+            try:
+                embedding = await self._embedding_client.embed_text(node.content)
+                node.set_embedding(embedding)
+                await self._storage.upsert_node(node)
+            except Exception as _emb_err:
+                import structlog as _sl
+                _sl.get_logger(__name__).warning(
+                    "Embedding retry failed in _sync_vector_store — skipping vector index",
+                    error=str(_emb_err),
+                    collection=self.collection,
+                )
+                return  # node stored in graph; semantic search skips it until re-embedded
 
         await self._vector_store.upsert(
             collection=self.collection,
@@ -145,9 +154,17 @@ class MemoryGraph:
             parent_node_ids=parent_node_ids or [],
             pinned=pinned,
         )
-        # Compute embedding
-        embedding = await self._embedding_client.embed_text(content)
-        node.set_embedding(embedding)
+        # Compute embedding — non-fatal; node is still stored for keyword search.
+        try:
+            embedding = await self._embedding_client.embed_text(content)
+            node.set_embedding(embedding)
+        except Exception as _emb_err:
+            import structlog as _sl
+            _sl.get_logger(__name__).warning(
+                "Embedding failed — storing node without vector",
+                error=str(_emb_err),
+                collection=self.collection,
+            )
 
         # Persist in graph and sync the hot vector cache when applicable.
         await self._storage.upsert_node(node)
@@ -300,7 +317,16 @@ class MemoryGraph:
         threshold: float = 0.3,
     ) -> list[VectorSearchResult]:
         """Return vector hits without hydrating full nodes from storage."""
-        query_embedding = await self._embedding_client.embed_text(query)
+        try:
+            query_embedding = await self._embedding_client.embed_text(query)
+        except Exception as _emb_err:
+            import structlog as _sl
+            _sl.get_logger(__name__).warning(
+                "Query embedding failed — semantic search returning empty",
+                error=str(_emb_err),
+                collection=self.collection,
+            )
+            return []
         return await self.semantic_search_hits_from_embedding(
             query_embedding=query_embedding,
             query=query,
@@ -333,9 +359,18 @@ class MemoryGraph:
             if embedding is None:
                 if not allow_embedding_generation:
                     continue
-                embedding = await self._embedding_client.embed_text(node.content)
-                node.set_embedding(embedding)
-                await self._storage.upsert_node(node)
+                try:
+                    embedding = await self._embedding_client.embed_text(node.content)
+                    node.set_embedding(embedding)
+                    await self._storage.upsert_node(node)
+                except Exception as _emb_err:
+                    import structlog as _sl
+                    _sl.get_logger(__name__).warning(
+                        "Embedding failed during seed — skipping node vector",
+                        error=str(_emb_err),
+                        collection=self.collection,
+                    )
+                    continue
             await self._vector_store.upsert(
                 collection=self.collection,
                 node_id=node.id,
@@ -657,7 +692,17 @@ class MemoryGraph:
         items: list of dicts matching add_node() kwargs.
         """
         contents = [item["content"] for item in items]
-        embeddings = await self._embedding_client.embed_batch(contents)
+        try:
+            embeddings = await self._embedding_client.embed_batch(contents)
+        except Exception as _emb_err:
+            import structlog as _sl
+            _sl.get_logger(__name__).warning(
+                "Batch embedding failed — storing nodes without vectors",
+                error=str(_emb_err),
+                count=len(contents),
+                collection=self.collection,
+            )
+            embeddings = [None] * len(contents)
 
         nodes = []
         for item, embedding in zip(items, embeddings):
@@ -675,7 +720,8 @@ class MemoryGraph:
                 parent_node_ids=item.get("parent_node_ids", []),
                 pinned=item.get("pinned", False),
             )
-            node.set_embedding(embedding)
+            if embedding is not None:
+                node.set_embedding(embedding)
             await self._storage.upsert_node(node)
             await self._sync_vector_store(node)
             nodes.append(node)

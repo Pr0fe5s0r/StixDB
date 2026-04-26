@@ -241,6 +241,14 @@ async def dedupe_collection(
     return await engine.dedupe_collection(collection, dry_run=dry_run)
 
 
+@router.post("/{collection}")
+async def create_collection(collection: str, request: Request):
+    """Create an empty collection (no-op if it already exists)."""
+    engine: StixDBEngine = request.app.state.engine
+    await engine._ensure_collection(collection)
+    return {"collection": collection, "status": "ready"}
+
+
 @router.delete("/{collection}")
 async def delete_collection(collection: str, request: Request):
     """Delete all data in a collection and unload it from the engine."""

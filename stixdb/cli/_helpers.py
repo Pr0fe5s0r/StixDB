@@ -136,6 +136,10 @@ def http_post(url: str, payload: dict, api_key: Optional[str] = None, timeout: i
         console.print(f"[red]✗[/red] Cannot reach server at [bold]{url}[/bold]")
         console.print("  Start one with [cyan]stixdb serve[/cyan] or [cyan]stixdb daemon start[/cyan].")
         raise typer.Exit(1)
+    except httpx.ReadError:
+        console.print(f"[red]✗[/red] Server closed the connection unexpectedly: [bold]{url}[/bold]")
+        console.print("  The server may still be starting up — wait a moment and retry.")
+        raise typer.Exit(1)
     except httpx.ReadTimeout:
         console.print(f"[red]✗[/red] Server timed out after {timeout}s: [bold]{url}[/bold]")
         console.print("  The server is busy. Try again in a moment.")
@@ -204,7 +208,7 @@ def http_delete(url: str, api_key: Optional[str] = None, timeout: int = 60) -> d
 # ── Daemon helpers ─────────────────────────────────────────────────────────────
 
 def daemon_running() -> tuple[bool, Optional[int]]:
-    """Return (is_alive, pid). Uses psutil when available, falls back to os.kill."""
+    """Return (is_alive, pid). Uses psutil when available, falls back to platform check."""
     if not DAEMON_PID.exists():
         return False, None
     try:
@@ -213,8 +217,19 @@ def daemon_running() -> tuple[bool, Optional[int]]:
             import psutil
             alive = psutil.pid_exists(pid)
         except ImportError:
-            os.kill(pid, 0)   # raises if dead
-            alive = True
+            if sys.platform == "win32":
+                # os.kill(pid, 0) is unreliable on Windows — use OpenProcess instead.
+                import ctypes
+                PROCESS_QUERY_INFORMATION = 0x0400
+                handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_INFORMATION, False, pid)
+                if handle:
+                    ctypes.windll.kernel32.CloseHandle(handle)
+                    alive = True
+                else:
+                    alive = False
+            else:
+                os.kill(pid, 0)   # raises OSError if dead on Unix/macOS
+                alive = True
         if alive:
             return True, pid
         return False, None

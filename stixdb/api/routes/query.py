@@ -26,8 +26,7 @@ class AskRequest(BaseModel):
     depth: int = 2
     system_prompt: Optional[str] = None
     output_schema: Optional[dict[str, Any]] = None
-    thinking_steps: int = 1    # >1 enables multi-hop reasoning loop
-    hops_per_step: int = 4     # max retrieval hops per thinking step
+    max_hops: int = 8          # safety cap on agent loop iterations
     max_tokens: Optional[int] = None  # cap LLM response length; None = use server default
 
 
@@ -36,6 +35,7 @@ class RetrieveRequest(BaseModel):
     top_k: int = 10
     threshold: float = 0.25
     depth: int = 1
+    mode: str = "hybrid"
 
 
 @router.post("/{collection}/ask")
@@ -55,8 +55,7 @@ async def ask(collection: str, body: AskRequest, request: Request):
         depth=body.depth,
         system_prompt=body.system_prompt,
         output_schema=body.output_schema,
-        thinking_steps=body.thinking_steps,
-        hops_per_step=body.hops_per_step,
+        max_hops=body.max_hops,
         max_tokens=body.max_tokens,
     )
     return response.to_dict()
@@ -65,22 +64,25 @@ async def ask(collection: str, body: AskRequest, request: Request):
 @router.post("/{collection}/ask/stream")
 async def ask_stream(collection: str, body: AskRequest, request: Request):
     """
-    Streaming agentic query — same as /ask but streams answer tokens as SSE.
+    Streaming agentic query — same as /ask but streams as SSE.
 
-    Each event is:  ``data: {"type": "answer"|"node_count", "content": "..."}``
+    When thinking_steps > 1 the stream emits ``{"type": "thinking", "content": "…"}``
+    events for each reasoning hop, then a final ``{"type": "answer", "content": "…"}``.
+    When thinking_steps == 1 the answer tokens are streamed progressively.
+
+    Each event is:  ``data: {"type": "thinking"|"answer"|"node_count", "content": "..."}``
     The stream ends with:  ``data: [DONE]``
     """
     engine: StixDBEngine = request.app.state.engine
 
     async def event_generator() -> AsyncIterator[str]:
-        async for chunk in engine.stream_chat(
+        stream_iter = engine.stream_recursive_chat(
             collection=collection,
             question=body.question,
-            top_k=body.top_k,
-            threshold=body.threshold,
-            depth=body.depth,
+            max_hops=body.max_hops,
             max_tokens=body.max_tokens,
-        ):
+        )
+        async for chunk in stream_iter:
             if chunk.get("type") == "metadata":
                 continue
             yield f"data: {json.dumps(chunk)}\n\n"
@@ -107,6 +109,7 @@ async def retrieve(collection: str, body: RetrieveRequest, request: Request):
         top_k=body.top_k,
         threshold=body.threshold,
         depth=body.depth,
+        mode=body.mode,
     )
     latency_ms = (perf_counter() - start) * 1000.0
     return {

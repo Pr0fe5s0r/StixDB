@@ -106,6 +106,9 @@ class StixDBEngine:
         self._embedding_client = build_embedding_client(self.config.embedding)
         self._backup_store = build_backup_store(self.config.backup)
 
+        from stixdb.ingestion.vlm import VLMDescriber
+        self._vlm_describer = VLMDescriber(self.config.vlm)
+
     def _build_storage_backend(self):
         if self.config.storage.mode == StorageMode.NEO4J:
             try:
@@ -435,6 +438,97 @@ class StixDBEngine:
         }
 
         ingested_at = time.time()
+
+        # ── Image files: describe with VLM, store as single node ─────────────
+        if not _is_docs:
+            from stixdb.ingestion.vlm import is_image_file
+            if is_image_file(filepath):
+                if not self._vlm_describer.enabled:
+                    logger.warning(
+                        "VLM not configured — skipping image file",
+                        source=source_name,
+                        hint="Run `stixdb init` and configure a VLM to enable image ingestion.",
+                    )
+                    return []
+                try:
+                    description = await self._vlm_describer.describe(filepath, source_name)
+                except Exception as exc:
+                    logger.error("VLM image description failed", source=source_name, error=str(exc))
+                    return []
+                if not description.strip():
+                    logger.warning("VLM returned empty description", source=source_name)
+                    return []
+                # ── Node 1: full VLM description (FACT — searchable body text) ──
+                common_image_meta = {
+                    "source_type": "image",
+                    "content_hash": document_hash,
+                    "ingested_at": ingested_at,
+                    "vlm_model": self.config.vlm.model,
+                    "filename": source_name,
+                    # Store the absolute path so VLM can re-read at query time
+                    "image_path": str(filepath),
+                }
+                desc_node = await graph.add_node(
+                    content=description,
+                    node_type=NodeType.FACT,
+                    tier=MemoryTier.SEMANTIC,
+                    importance=0.7,
+                    source=source_name,
+                    tags=(tags or []) + ["image", "vlm-described"],
+                    metadata=common_image_meta,
+                )
+
+                # ── Node 2: one-line image caption (SUMMARY — graph anchor) ────
+                # Ask the VLM for a compact title/caption that acts as a
+                # hub node in the graph.  The full description links to it
+                # via a SUMMARIZES edge so traversal surfaces both nodes.
+                caption = ""
+                try:
+                    caption = await self._vlm_describer.describe(
+                        filepath,
+                        source_name,
+                        prompt=(
+                            "In one concise sentence (max 25 words), "
+                            "give a title or caption for this image."
+                        ),
+                    )
+                    caption = caption.strip()
+                except Exception:
+                    caption = f"Image: {source_name}"
+
+                summary_node = await graph.add_node(
+                    content=caption or f"Image: {source_name}",
+                    node_type=NodeType.SUMMARY,
+                    tier=MemoryTier.SEMANTIC,
+                    importance=0.8,
+                    source=source_name,
+                    tags=(tags or []) + ["image", "image-summary"],
+                    metadata={**common_image_meta, "is_image_caption": True},
+                )
+
+                # Link: summary_node --SUMMARIZES--> desc_node
+                from stixdb.graph.edge import RelationEdge, RelationType, EdgeProvenance
+                await graph.store_edge(RelationEdge(
+                    collection=collection,
+                    source_id=summary_node.id,
+                    target_id=desc_node.id,
+                    relation_type=RelationType.SUMMARIZES,
+                    weight=1.0,
+                    confidence=1.0,
+                    provenance=EdgeProvenance.EXTRACTED,
+                    created_by="vlm-ingest",
+                ))
+
+                logger.info(
+                    "Image ingested",
+                    source=source_name,
+                    desc_node=desc_node.id,
+                    summary_node=summary_node.id,
+                    collection=collection,
+                )
+                self._schedule_enrichment(collection, graph, [desc_node, summary_node])
+                return [desc_node.id, summary_node.id]
+
         extraction = extract_document_segments(filepath, parser=parser)
 
         items = []
@@ -911,92 +1005,26 @@ class StixDBEngine:
         depth: int = 2,
         system_prompt: Optional[str] = None,
         output_schema: Optional[dict] = None,
-        thinking_steps: int = 1,
-        hops_per_step: int = 4,
+        max_hops: int = 8,
         max_tokens: Optional[int] = None,
     ) -> ContextResponse:
         """
         Ask the StixDB agent a natural-language question.
 
-        When thinking_steps > 1, the engine runs the multi-hop reasoning loop
-        (recursive_chat) which issues multiple retrieval hops per step, refines
-        its search query based on what it finds, and checks confidence before
-        stopping.  This produces richer answers for complex questions at the
-        cost of more LLM calls.
+        The agent autonomously decides how many retrieval hops to perform —
+        it keeps searching until confident or until max_hops is reached.
 
         Args:
-            thinking_steps: Number of reasoning steps (1 = single-pass, ≥2 = multi-hop).
-            hops_per_step:  Max retrieval hops within each thinking step.
+            max_hops: Safety cap on retrieval iterations (default 8).
         """
         self._assert_started()
-        if thinking_steps > 1:
-            return await self.recursive_chat(
-                collection=collection,
-                question=question,
-                thinking_steps=thinking_steps,
-                hops_per_step=hops_per_step,
-                threshold=max(threshold, 0.25),
-            )
-        _, _, broker = await self._ensure_collection(collection)
-        response = await broker.ask(
+        return await self.recursive_chat(
+            collection=collection,
             question=question,
-            top_k=top_k,
-            search_threshold=threshold,
-            graph_depth=depth,
-            system_prompt=system_prompt,
-            output_schema=output_schema,
+            max_hops=max_hops,
+            threshold=max(threshold, 0.25),
             max_tokens=max_tokens,
-            query_origin="user",
         )
-
-        # Persist reasoning as a traversable sub-node when the answer is confident.
-        # This builds a knowledge graph of Q->A->R->sources for future traversal,
-        # so similar future questions can follow reasoning edges to find richer context.
-        if (
-            response.reasoning_trace
-            and response.confidence >= 0.65
-            and response.sources
-        ):
-            try:
-                # Store the answer itself as a node so the reasoning can link to it
-                graph = self._graphs[collection]
-                answer_text = str(response.answer or "").strip()
-                if answer_text and self._is_useful_maintenance_answer(answer_text):
-                    answer_key = self._hash_text(f"answer:{question.strip().lower()}")
-                    # Find or create the answer node
-                    all_facts = await graph.list_nodes(node_type="fact", limit=10000)
-                    answer_node = next(
-                        (n for n in all_facts
-                         if (n.metadata or {}).get("answer_key") == answer_key),
-                        None,
-                    )
-                    if answer_node is None:
-                        answer_node = await graph.add_node(
-                            content=answer_text,
-                            node_type=NodeType.FACT,
-                            tier=MemoryTier.EPISODIC,
-                            importance=min(0.9, 0.5 + response.confidence * 0.4),
-                            source="agent-answer",
-                            tags=["user-query", "answer"],
-                            metadata={
-                                "answer_key": answer_key,
-                                "question": question,
-                                "confidence": response.confidence,
-                            },
-                        )
-                    await self._upsert_reasoning_subnode(
-                        collection=collection,
-                        parent_node_id=answer_node.id,
-                        reasoning_trace=response.reasoning_trace,
-                        source_node_ids=[s.node_id for s in response.sources[:8]],
-                        question=question,
-                        label=f"Q: {question[:80]}",
-                        confidence=response.confidence,
-                    )
-            except Exception as exc:
-                logger.debug("Failed to persist user query reasoning subgraph", error=str(exc))
-
-        return response
 
     async def retrieve(
         self,
@@ -1062,11 +1090,22 @@ class StixDBEngine:
             max_tokens=max_tokens,
             query_origin="user",
         )
-        
+
+        # ── Vision grounding: if any retrieved nodes are image nodes and
+        # the VLM is configured, re-answer using the actual image bytes.
+        if self._vlm_describer.enabled:
+            response = await self._maybe_answer_with_vision(
+                question=question,
+                response=response,
+                history=history,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
         if session_id:
             session.add_message("user", question)
             session.add_message("assistant", str(response.answer))
-            
+
         return response
 
     async def _run_collection_maintenance(self, collection: str) -> dict:
@@ -1542,10 +1581,11 @@ class StixDBEngine:
         full_answer = ""
         res_buffer = ""
         answer_started = False
+        retrieved_nodes = [c[0] for c in candidates[:broker.reasoner.config.max_context_nodes]]
         async for chunk in broker.reasoner.stream_reason(
             collection=collection,
             question=question,
-            nodes=[c[0] for c in candidates[:broker.reasoner.config.max_context_nodes]],
+            nodes=retrieved_nodes,
             history=history,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -1572,18 +1612,225 @@ class StixDBEngine:
         if not full_answer and res_buffer:
             parsed = broker.reasoner._parse_response(
                 res_buffer,
-                [c[0] for c in candidates[:broker.reasoner.config.max_context_nodes]],
+                retrieved_nodes,
                 0.0,
             )
             full_answer = str(parsed.answer)
             yield {"type": "answer", "content": full_answer}
+
+        # ── Vision grounding: re-answer using actual image bytes if images
+        # were retrieved and the VLM is configured.
+        if self._vlm_describer.enabled:
+            vision_answer = await self._stream_vision_answer(
+                question=question,
+                nodes=retrieved_nodes,
+                history=history,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            if vision_answer:
+                # Replace the text-only answer with the vision-grounded one
+                yield {"type": "answer", "content": "\n\n---\n*Vision-grounded answer:*\n" + vision_answer}
+                full_answer = vision_answer
 
         # Step 3: Record history
         if session:
             session.add_message("user", question)
             session.add_message("assistant", full_answer)
 
-    async def _run_dynamic_thinking(
+    # ── Vision grounding helpers ──────────────────────────────────────────── #
+
+    @staticmethod
+    def _collect_image_paths(nodes: list) -> list[str]:
+        """Return absolute paths of image files referenced by nodes, if they exist on disk."""
+        seen: set[str] = set()
+        paths: list[str] = []
+        for node in nodes:
+            meta = node.metadata or {}
+            if meta.get("source_type") != "image":
+                continue
+            ip = meta.get("image_path") or ""
+            if ip and ip not in seen:
+                import os as _os
+                if _os.path.isfile(ip):
+                    seen.add(ip)
+                    paths.append(ip)
+        return paths
+
+    async def _maybe_answer_with_vision(
+        self,
+        *,
+        question: str,
+        response: "ContextResponse",
+        history: list[dict],
+        temperature: Optional[float],
+        max_tokens: Optional[int],
+    ) -> "ContextResponse":
+        """
+        If image nodes are present in the response sources, call the VLM with
+        the actual image bytes and return a vision-grounded ContextResponse.
+        Falls back to the original text-only response if no valid images found.
+        """
+        source_nodes = [s for s in (response.sources or [])]
+        # Reconstruct node objects from source nodes
+        image_paths = []
+        for src in source_nodes:
+            meta = getattr(src, "metadata", {}) or {}
+            if meta.get("source_type") == "image":
+                ip = meta.get("image_path", "")
+                import os as _os
+                if ip and _os.path.isfile(ip) and ip not in image_paths:
+                    image_paths.append(ip)
+
+        if not image_paths:
+            return response
+
+        try:
+            vision_answer = await self._call_vlm_with_images(
+                question=question,
+                image_paths=image_paths,
+                history=history,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            if vision_answer:
+                # Wrap in a new ContextResponse keeping sources/trace intact
+                from stixdb.context.response import ContextResponse as _CR
+                return _CR(
+                    answer=vision_answer,
+                    sources=response.sources,
+                    reasoning_trace=response.reasoning_trace,
+                    confidence=response.confidence,
+                )
+        except Exception as exc:
+            logger.warning("Vision grounding failed, using text answer", error=str(exc))
+
+        return response
+
+    async def _stream_vision_answer(
+        self,
+        *,
+        question: str,
+        nodes: list,
+        history: list[dict],
+        temperature: Optional[float],
+        max_tokens: Optional[int],
+    ) -> str:
+        """
+        Return a VLM answer if any nodes reference on-disk images; else return ''.
+        Used by stream_chat() to optionally append a vision-grounded answer.
+        """
+        image_paths = self._collect_image_paths(nodes)
+        if not image_paths:
+            return ""
+        try:
+            return await self._call_vlm_with_images(
+                question=question,
+                image_paths=image_paths,
+                history=history,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as exc:
+            logger.warning("Vision grounding (stream) failed", error=str(exc))
+            return ""
+
+    async def _call_vlm_with_images(
+        self,
+        *,
+        question: str,
+        image_paths: list[str],
+        history: list[dict],
+        temperature: Optional[float],
+        max_tokens: Optional[int],
+    ) -> str:
+        """
+        Build a vision-capable prompt with all retrieved images and send it
+        to the configured VLM.  Supports up to 4 images per call.
+        Returns the model's answer text.
+        """
+        import base64
+        from stixdb.ingestion.vlm import _mime_type
+        from pathlib import Path as _Path
+
+        # Cap at 4 images to stay within most providers' context limits
+        image_paths = image_paths[:4]
+
+        # Build multi-image content list (OpenAI / Anthropic vision format)
+        content: list[dict] = []
+        for ip in image_paths:
+            p = _Path(ip)
+            b64 = base64.b64encode(p.read_bytes()).decode("utf-8")
+            mime = _mime_type(p)
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            })
+
+        # History context — brief, to leave room for image tokens
+        hist_text = ""
+        if history:
+            recent = history[-4:]  # last 2 turns
+            hist_text = "\n".join(
+                f"{m.get('role','user').capitalize()}: {m.get('content','')}"
+                for m in recent
+            )
+
+        prompt = (
+            f"{hist_text}\n\nUser: {question}\n\n"
+            "You have access to the image(s) above that were retrieved from memory. "
+            "Answer the user's question using the visual content directly. "
+            "Be specific about what you see in the image(s)."
+        ).strip()
+        content.append({"type": "text", "text": prompt})
+
+        # Call the VLM using its low-level provider method
+        cfg = self.config.vlm
+        from stixdb.config import LLMProvider
+        if cfg.provider in (LLMProvider.OPENAI, LLMProvider.CUSTOM):
+            from openai import AsyncOpenAI
+            kwargs: dict = {}
+            if cfg.provider == LLMProvider.CUSTOM:
+                kwargs["base_url"] = cfg.custom_base_url
+                kwargs["api_key"] = cfg.custom_api_key or "dummy"
+            else:
+                if cfg.openai_api_key:
+                    kwargs["api_key"] = cfg.openai_api_key
+            client = AsyncOpenAI(**kwargs)
+            resp = await client.chat.completions.create(
+                model=cfg.model,
+                messages=[{"role": "user", "content": content}],
+                max_tokens=max_tokens or 1024,
+                temperature=temperature or 0.2,
+            )
+            return resp.choices[0].message.content or ""
+
+        elif cfg.provider == LLMProvider.ANTHROPIC:
+            import anthropic
+            ant_content = []
+            for item in content:
+                if item["type"] == "image_url":
+                    url = item["image_url"]["url"]
+                    # Extract base64 and mime from data URI
+                    _, rest = url.split(",", 1)
+                    mime_part = url.split(";")[0].split(":")[1]
+                    ant_content.append({
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": mime_part, "data": rest},
+                    })
+                else:
+                    ant_content.append({"type": "text", "text": item["text"]})
+            client = anthropic.AsyncAnthropic(api_key=cfg.anthropic_api_key)
+            resp = await client.messages.create(
+                model=cfg.model,
+                max_tokens=max_tokens or 1024,
+                messages=[{"role": "user", "content": ant_content}],
+            )
+            return resp.content[0].text if resp.content else ""
+
+        return ""
+
+    async def _agent_loop(
         self,
         *,
         broker: ContextBroker,
@@ -1591,85 +1838,82 @@ class StixDBEngine:
         collection: str,
         question: str,
         history: list[dict],
-        thinking_steps: int = 2,
-        hops_per_step: int = 4,
-        min_hops_before_confidence: int = 4,
+        max_hops: int = 8,
         confidence_threshold: float = 0.7,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
-    ) -> tuple[ReasoningResult, list[dict[str, Any]], list[Any], int]:
+    ) -> tuple[ReasoningResult, list[Any], int]:
         """
-        Run a bounded multi-hop reasoning loop.
+        Autonomous ReAct agent loop.
 
-        The model can keep adapting the next query at any time, but we only
-        check confidence after a full thinking step of several hops.
+        The agent decides when it has enough context to answer — there is no
+        fixed number of thinking steps.  Each iteration:
+          THOUGHT  — plan_next_hop() generates a short thought + next query
+          SEARCH   — retrieve nodes for that query (OBSERVATION)
+          REASON   — synthesise over all accumulated nodes; check is_complete
+        The loop exits as soon as the LLM signals it is done (is_complete=True,
+        confidence >= threshold, or no new suggested_query), or after max_hops.
         """
         accumulated_nodes: list[Any] = []
         seen_node_ids: set[str] = set()
         current_query = question
         last_reasoning: ReasoningResult | None = None
-        step_summaries: list[dict[str, Any]] = []
+        last_query: Optional[str] = None
+        last_new_nodes = 0
+        low_progress_streak = 0
         total_hops = 0
 
-        for step_index in range(thinking_steps):
-            step_hops = 0
-            step_reasoning: ReasoningResult | None = None
+        for hop_number in range(1, max_hops + 1):
+            total_hops = hop_number
 
-            for _ in range(hops_per_step):
-                total_hops += 1
-                step_hops += 1
+            # THOUGHT + SEARCH: LLM plans the next retrieval query
+            hop_plan = await broker.reasoner.plan_next_hop(
+                question=question,
+                current_query=current_query,
+                nodes=accumulated_nodes,
+                history=history,
+                prior_reasoning=last_reasoning.reasoning_trace if last_reasoning else None,
+                hop_number=hop_number,
+                max_hops=max_hops,
+                last_query=last_query,
+                last_new_nodes=last_new_nodes,
+                last_confidence=last_reasoning.confidence if last_reasoning else None,
+                low_progress_streak=low_progress_streak,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            active_query = hop_plan.query.strip() or current_query
 
-                nodes, _, _ = await broker.prepare_context(query=current_query)
-                new_nodes = [n for n in nodes if n.id not in seen_node_ids]
-                accumulated_nodes.extend(new_nodes)
-                for node in new_nodes:
-                    seen_node_ids.add(node.id)
-                    agent.record_access(node.id)
+            # OBSERVATION: retrieve nodes for the planned query
+            nodes, _, _ = await broker.prepare_context(query=active_query)
+            new_nodes = [n for n in nodes if n.id not in seen_node_ids]
+            accumulated_nodes.extend(new_nodes)
+            for node in new_nodes:
+                seen_node_ids.add(node.id)
+                agent.record_access(node.id)
 
-                step_reasoning = await broker.reasoner.reason(
-                    collection=collection,
-                    question=question,
-                    nodes=accumulated_nodes,
-                    history=history,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                last_reasoning = step_reasoning
+            last_query = active_query
+            last_new_nodes = len(new_nodes)
+            low_progress_streak = low_progress_streak + 1 if last_new_nodes == 0 else 0
 
-                if step_hops < min_hops_before_confidence:
-                    current_query = self._pick_follow_up_query(
-                        original_question=question,
-                        current_query=current_query,
-                        suggested_query=step_reasoning.suggested_query,
-                        nodes=accumulated_nodes,
-                        hop_index=step_hops,
-                    )
-                    continue
-
-                if step_reasoning.is_complete or not step_reasoning.suggested_query:
-                    break
-
-                next_query = step_reasoning.suggested_query.strip()
-                if not next_query or next_query.lower() == current_query.strip().lower():
-                    break
-                current_query = next_query
-
-            if step_reasoning is None:
-                break
-
-            step_summaries.append(
-                {
-                    "step": step_index + 1,
-                    "hops": step_hops,
-                    "confidence": step_reasoning.confidence,
-                    "complete": step_reasoning.is_complete,
-                }
+            # REASON: synthesise over all accumulated nodes
+            last_reasoning = await broker.reasoner.reason(
+                collection=collection,
+                question=question,
+                nodes=accumulated_nodes,
+                history=history,
+                temperature=temperature,
+                max_tokens=max_tokens,
             )
 
-            if step_reasoning.is_complete or step_reasoning.confidence >= confidence_threshold or not step_reasoning.suggested_query:
+            # Agent decides: done or keep searching?
+            if last_reasoning.is_complete or last_reasoning.confidence >= confidence_threshold:
                 break
 
-            current_query = step_reasoning.suggested_query
+            next_query = (last_reasoning.suggested_query or "").strip()
+            if not next_query or next_query.lower() == active_query.lower():
+                break
+            current_query = next_query
 
         if last_reasoning is None:
             last_reasoning = await broker.reasoner.reason(
@@ -1681,62 +1925,55 @@ class StixDBEngine:
                 max_tokens=max_tokens,
             )
 
-        return last_reasoning, step_summaries, accumulated_nodes, total_hops
+        return last_reasoning, accumulated_nodes, total_hops
 
     async def recursive_chat(
         self,
         collection: str,
         question: str,
         session_id: Optional[str] = None,
-        thinking_steps: int = 2,
-        hops_per_step: int = 4,
+        max_hops: int = 8,
         threshold: float = 0.7,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> ContextResponse:
         """
-        Autonomous multi-hop reasoning (Thinking Mode).
-        Continues searching in bounded thinking steps and checks confidence
-        after each step.
+        Autonomous agent loop — the agent decides when it has enough context.
+        Runs up to max_hops retrieval iterations; stops early when confident.
         """
         self._assert_started()
         _, agent, broker = await self._ensure_collection(collection)
-        
+
         history = []
         if session_id:
             history = self.sessions.get_session(session_id).get_history()
-        last_reasoning, step_summaries, accumulated_nodes, total_hops = await self._run_dynamic_thinking(
+
+        last_reasoning, accumulated_nodes, total_hops = await self._agent_loop(
             broker=broker,
             agent=agent,
             collection=collection,
             question=question,
             history=history,
-            thinking_steps=thinking_steps,
-            hops_per_step=hops_per_step,
-            min_hops_before_confidence=4,
+            max_hops=max_hops,
             confidence_threshold=threshold,
             temperature=temperature,
             max_tokens=max_tokens,
         )
 
-        # Build final response
         response = ContextResponse(
             question=question,
             answer=last_reasoning.answer,
             reasoning_trace=(
-                f"--- Thinking Status ---\n"
-                f"Dynamic thinking completed in {len(step_summaries)} step(s) "
-                f"across {total_hops} hop(s). Confidence was checked after each step.\n\n"
-                f"--- Final Chain of Thought ---\n"
+                f"Agent loop completed in {total_hops} hop(s).\n\n"
                 f"{last_reasoning.reasoning_trace}"
             ),
             sources=[SourceNode.from_node(n, 1.0) for n in accumulated_nodes[:broker.reasoner.config.max_context_nodes]],
             total_nodes_searched=len({n.id for n in accumulated_nodes}),
             confidence=last_reasoning.confidence,
-            retrieval_method=f"recursive(steps={len(step_summaries)}, hops={total_hops})",
+            retrieval_method=f"agent_loop(hops={total_hops})",
             collection=collection,
             model_used=last_reasoning.model_used,
-            latency_ms=0.0, # We'll compute this if needed
+            latency_ms=0.0,
         )
 
         if session_id:
@@ -1751,22 +1988,25 @@ class StixDBEngine:
         collection: str,
         question: str,
         session_id: Optional[str] = None,
-        thinking_steps: int = 2,
-        hops_per_step: int = 4,
-        min_hops_before_confidence: int = 4,
+        max_hops: int = 8,
         threshold: float = 0.7,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> AsyncIterator[dict]:
         """
-        Streaming version of autonomous multi-hop reasoning.
+        Streaming autonomous agent loop.
+
+        Yields ``{"type": "thinking", "content": "…"}`` for each retrieval hop,
+        then a final ``{"type": "answer", "content": "…"}``.
+        The agent decides when it has enough context — there is no fixed step count.
         """
         self._assert_started()
         _, agent, broker = await self._ensure_collection(collection)
-        
+
         history = []
         if session_id:
             history = self.sessions.get_session(session_id).get_history()
+
         accumulated_nodes: list[Any] = []
         seen_node_ids: set[str] = set()
         current_query = question
@@ -1775,80 +2015,55 @@ class StixDBEngine:
         last_new_nodes = 0
         low_progress_streak = 0
 
-        for step_index in range(thinking_steps):
-            step_hops = 0
-            for hop_index in range(hops_per_step):
-                step_hops += 1
-                hop_plan = await broker.reasoner.plan_next_hop(
-                    question=question,
-                    current_query=current_query,
-                    nodes=accumulated_nodes,
-                    history=history,
-                    prior_reasoning=last_reasoning.reasoning_trace if last_reasoning else None,
-                    step_index=step_index,
-                    thinking_steps=thinking_steps,
-                    hop_index=hop_index,
-                    hops_per_step=hops_per_step,
-                    last_query=last_query,
-                    last_new_nodes=last_new_nodes,
-                    last_confidence=last_reasoning.confidence if last_reasoning else None,
-                    low_progress_streak=low_progress_streak,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                active_query = hop_plan.query.strip() or current_query
-                yield {
-                    "type": "thinking",
-                    "content": hop_plan.thought,
-                }
+        for hop_number in range(1, max_hops + 1):
+            # THOUGHT + SEARCH
+            hop_plan = await broker.reasoner.plan_next_hop(
+                question=question,
+                current_query=current_query,
+                nodes=accumulated_nodes,
+                history=history,
+                prior_reasoning=last_reasoning.reasoning_trace if last_reasoning else None,
+                hop_number=hop_number,
+                max_hops=max_hops,
+                last_query=last_query,
+                last_new_nodes=last_new_nodes,
+                last_confidence=last_reasoning.confidence if last_reasoning else None,
+                low_progress_streak=low_progress_streak,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            active_query = hop_plan.query.strip() or current_query
+            yield {"type": "thinking", "content": hop_plan.thought}
 
-                nodes, _, _ = await broker.prepare_context(query=active_query)
-                new_nodes = [n for n in nodes if n.id not in seen_node_ids]
-                accumulated_nodes.extend(new_nodes)
-                for node in new_nodes:
-                    seen_node_ids.add(node.id)
-                    agent.record_access(node.id)
-                last_query = active_query
-                last_new_nodes = len(new_nodes)
-                if last_new_nodes == 0:
-                    low_progress_streak += 1
-                else:
-                    low_progress_streak = 0
+            # OBSERVATION
+            nodes, _, _ = await broker.prepare_context(query=active_query)
+            new_nodes = [n for n in nodes if n.id not in seen_node_ids]
+            accumulated_nodes.extend(new_nodes)
+            for node in new_nodes:
+                seen_node_ids.add(node.id)
+                agent.record_access(node.id)
+            last_query = active_query
+            last_new_nodes = len(new_nodes)
+            low_progress_streak = low_progress_streak + 1 if last_new_nodes == 0 else 0
 
-                last_reasoning = await broker.reasoner.reason(
-                    collection=collection,
-                    question=question,
-                    nodes=accumulated_nodes,
-                    history=history,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
+            # REASON
+            last_reasoning = await broker.reasoner.reason(
+                collection=collection,
+                question=question,
+                nodes=accumulated_nodes,
+                history=history,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
 
-                if step_hops < min_hops_before_confidence:
-                    current_query = self._pick_follow_up_query(
-                        original_question=question,
-                        current_query=active_query,
-                        suggested_query=last_reasoning.suggested_query,
-                        nodes=accumulated_nodes,
-                        hop_index=step_hops,
-                    )
-                    continue
-
-                if last_reasoning.is_complete or not last_reasoning.suggested_query:
-                    break
-
-                next_query = last_reasoning.suggested_query.strip()
-                if not next_query or next_query.lower() == active_query.strip().lower():
-                    break
-                current_query = next_query
-
-            if last_reasoning is None:
+            # Agent decides: done or keep searching?
+            if last_reasoning.is_complete or last_reasoning.confidence >= threshold:
                 break
 
-            if last_reasoning.is_complete or last_reasoning.confidence >= threshold or not last_reasoning.suggested_query:
+            next_query = (last_reasoning.suggested_query or "").strip()
+            if not next_query or next_query.lower() == active_query.lower():
                 break
-
-            current_query = last_reasoning.suggested_query
+            current_query = next_query
 
         if last_reasoning is None:
             last_reasoning = await broker.reasoner.reason(

@@ -176,6 +176,17 @@ class EmbeddingConfig(BaseModel):
     custom_api_key: Optional[str] = None
 
 
+class VLMConfig(BaseModel):
+    """Runtime configuration for the Vision Language Model used during image ingestion."""
+    provider: LLMProvider = LLMProvider.NONE   # NONE = image ingestion disabled
+    model: str = ""
+    openai_api_key: Optional[str] = None
+    anthropic_api_key: Optional[str] = None
+    ollama_base_url: str = "http://localhost:11434"
+    custom_base_url: Optional[str] = None
+    custom_api_key: Optional[str] = None
+
+
 class ApiServerConfig(BaseModel):
     """Configuration for the StixDB FastAPI Server."""
     port: int = 4020
@@ -224,6 +235,16 @@ LLM_MODEL_SUGGESTIONS: dict[str, list[str]] = {
     "custom":      [],
     "none":        [],
 }
+VLM_MODEL_SUGGESTIONS: dict[str, list[str]] = {
+    "openai":      ["gpt-4o", "gpt-4o-mini"],
+    "anthropic":   ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
+    "nebius":      ["Qwen/Qwen2-VL-72B-Instruct", "microsoft/Phi-4-multimodal-instruct"],
+    "openrouter":  ["openai/gpt-4o", "anthropic/claude-3.5-sonnet", "google/gemini-flash-1.5"],
+    "ollama":      ["llava:latest", "llava-phi3", "moondream"],
+    "custom":      [],
+    "none":        [],
+}
+
 EMBEDDING_MODEL_SUGGESTIONS: dict[str, list[str]] = {
     "local":       ["all-MiniLM-L6-v2", "all-mpnet-base-v2", "BAAI/bge-small-en-v1.5"],
     "openai":      ["text-embedding-3-small", "text-embedding-3-large"],
@@ -265,6 +286,14 @@ class EmbeddingFileConfig(BaseModel):
     model: str
     dimensions: int = 384
     api_key: Optional[str] = None      # raw key value
+    base_url: Optional[str] = None
+
+
+class VLMFileConfig(BaseModel):
+    """Vision Language Model config stored in config.json (optional)."""
+    provider: str           # "openai"|"anthropic"|"nebius"|"openrouter"|"ollama"|"custom"|"none"
+    model: str
+    api_key: Optional[str] = None
     base_url: Optional[str] = None
 
 
@@ -338,6 +367,7 @@ class ConfigFile(BaseModel):
     """
     llm: LLMFileConfig
     embedding: EmbeddingFileConfig
+    vlm: Optional[VLMFileConfig] = None           # None = image ingestion disabled
     storage: StorageFileConfig = Field(default_factory=StorageFileConfig)
     ingestion: IngestionFileConfig = Field(default_factory=IngestionFileConfig)
     agent: AgentFileConfig = Field(default_factory=AgentFileConfig)
@@ -373,6 +403,7 @@ class StixDBConfig(BaseModel):
     reasoner: ReasonerConfig = Field(default_factory=ReasonerConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
+    vlm: VLMConfig = Field(default_factory=VLMConfig)   # NONE by default; enable in config
     ingestion: IngestionConfig = Field(default_factory=IngestionConfig)
     api: ApiServerConfig = Field(default_factory=ApiServerConfig)
     backup: BackupConfig = Field(default_factory=BackupConfig)
@@ -479,6 +510,22 @@ class StixDBConfig(BaseModel):
             custom_base_url=emb_base_url if emb_provider == EmbeddingProvider.CUSTOM else base.embedding.custom_base_url,
             custom_api_key=emb_api_key if emb_provider == EmbeddingProvider.CUSTOM else base.embedding.custom_api_key,
         )
+
+        # ── VLM ──────────────────────────────────────────────────────────────
+        if cf.vlm and cf.vlm.provider != "none":
+            vlm_provider = llm_provider_map.get(cf.vlm.provider, LLMProvider.CUSTOM)
+            vlm_base_url = cf.vlm.base_url or NAMED_LLM_PRESETS.get(cf.vlm.provider, {}).get("base_url")
+            vlm_api_key = cf.vlm.api_key or None
+            base.vlm = VLMConfig(
+                provider=vlm_provider,
+                model=cf.vlm.model,
+                openai_api_key=vlm_api_key if cf.vlm.provider == "openai" else None,
+                anthropic_api_key=vlm_api_key if cf.vlm.provider == "anthropic" else None,
+                ollama_base_url=vlm_base_url or "http://localhost:11434",
+                custom_base_url=vlm_base_url if vlm_provider == LLMProvider.CUSTOM else None,
+                custom_api_key=vlm_api_key if vlm_provider == LLMProvider.CUSTOM else None,
+            )
+        # else: leave base.vlm at default VLMConfig(provider=NONE) — images skipped
 
         # ── Storage ───────────────────────────────────────────────────────────
         storage_mode_map = {
@@ -621,6 +668,15 @@ class StixDBConfig(BaseModel):
                 ollama_base_url=_e("OLLAMA_BASE_URL", "http://localhost:11434"),
                 custom_base_url=os.getenv("STIXDB_EMBEDDING_CUSTOM_BASE_URL") or None,
                 custom_api_key=os.getenv("STIXDB_EMBEDDING_CUSTOM_API_KEY") or None,
+            ),
+            vlm=VLMConfig(
+                provider=LLMProvider(_e("STIXDB_VLM_PROVIDER", "none")),
+                model=_e("STIXDB_VLM_MODEL", ""),
+                openai_api_key=os.getenv("OPENAI_API_KEY") or None,
+                anthropic_api_key=os.getenv("ANTHROPIC_API_KEY") or None,
+                ollama_base_url=_e("OLLAMA_BASE_URL", "http://localhost:11434"),
+                custom_base_url=os.getenv("STIXDB_VLM_CUSTOM_BASE_URL") or None,
+                custom_api_key=os.getenv("STIXDB_VLM_CUSTOM_API_KEY") or None,
             ),
             ingestion=IngestionConfig(
                 default_chunk_size=int(_e("STIXDB_CHUNK_SIZE", "1000")),

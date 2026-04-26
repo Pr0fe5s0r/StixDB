@@ -162,10 +162,22 @@ def daemon_stop():
         DAEMON_PID.unlink(missing_ok=True)
         raise typer.Exit(0)
     try:
-        import signal
-        os.kill(pid, signal.SIGTERM)
+        if sys.platform == "win32":
+            import subprocess as _sp
+            result = _sp.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0 and "not found" not in result.stderr.lower():
+                console.print(f"[red]Failed to stop daemon PID {pid}:[/red] {result.stderr.strip()}")
+                raise typer.Exit(1)
+        else:
+            import signal
+            os.kill(pid, signal.SIGTERM)
         DAEMON_PID.unlink(missing_ok=True)
         console.print(f"[green]✓[/green] Daemon (PID [bold]{pid}[/bold]) stopped.")
+    except typer.Exit:
+        raise
     except Exception as exc:
         console.print(f"[red]Failed to stop daemon PID {pid}:[/red] {exc}")
         raise typer.Exit(1)

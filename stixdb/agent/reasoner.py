@@ -167,10 +167,8 @@ def build_hop_plan_prompt(
     current_query: str,
     prior_reasoning: Optional[str],
     nodes: list[MemoryNode],
-    step_index: int,
-    thinking_steps: int,
-    hop_index: int,
-    hops_per_step: int,
+    hop_number: int,
+    max_hops: int,
     last_query: Optional[str],
     last_new_nodes: int,
     last_confidence: Optional[float],
@@ -191,12 +189,11 @@ def build_hop_plan_prompt(
 
     return (
         f"USER QUESTION: {question}\n"
-        f"THINKING STEP: {step_index + 1}/{thinking_steps}\n"
-        f"HOP: {hop_index + 1}/{hops_per_step}\n"
+        f"ITERATION: {hop_number}/{max_hops}\n"
         f"CURRENT SEARCH ANGLE: {current_query}\n"
         f"LAST QUERY TRIED: {last_query or 'None yet.'}\n"
         f"LAST HOP NEW SOURCES: {last_new_nodes}\n"
-        f"LAST HOP CONFIDENCE: {last_confidence if last_confidence is not None else 'unknown'}\n"
+        f"LAST CONFIDENCE: {last_confidence if last_confidence is not None else 'unknown'}\n"
         f"LOW PROGRESS STREAK: {low_progress_streak}\n"
         f"CURRENT AWARENESS:\n{awareness}\n"
         f"LAST REASONING SUMMARY: {prior or 'None yet.'}\n\n"
@@ -308,10 +305,8 @@ class Reasoner:
         nodes: list[MemoryNode],
         history: Optional[list[dict]] = None,
         prior_reasoning: Optional[str] = None,
-        step_index: int = 0,
-        thinking_steps: int = 1,
-        hop_index: int = 0,
-        hops_per_step: int = 1,
+        hop_number: int = 1,
+        max_hops: int = 8,
         last_query: Optional[str] = None,
         last_new_nodes: int = 0,
         last_confidence: Optional[float] = None,
@@ -327,10 +322,8 @@ class Reasoner:
             current_query=current_query,
             prior_reasoning=prior_reasoning,
             nodes=nodes,
-            step_index=step_index,
-            thinking_steps=thinking_steps,
-            hop_index=hop_index,
-            hops_per_step=hops_per_step,
+            hop_number=hop_number,
+            max_hops=max_hops,
             last_query=last_query,
             last_new_nodes=last_new_nodes,
             last_confidence=last_confidence,

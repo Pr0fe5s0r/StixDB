@@ -78,6 +78,26 @@ def collections_list(
     console.print(t)
 
 
+@collections_app.command("create")
+def collections_create(
+    name: str = typer.Argument(..., help="Name of the collection to create."),
+    host: str = typer.Option("localhost", help="Server host."),
+    port: int = typer.Option(0, help="Server port."),
+):
+    """
+    [bold]Create an empty collection[/bold].
+
+    Safe to run on an existing collection — it is a no-op if the collection
+    already exists.
+
+    Example:
+      stixdb collections create proj_myapp
+    """
+    base, api_key = _conn(host, port)
+    http_post(f"{base}/collections/{name}", {}, api_key)
+    console.print(f"[green]✓[/green] Collection [bold cyan]{name}[/bold cyan] is ready.")
+
+
 @collections_app.command("delete")
 def collections_delete(
     name: str = typer.Argument(..., help="Collection name to delete."),
@@ -451,12 +471,13 @@ def cmd_ingest(
     [bold]Ingest a file or folder[/bold] into a collection.
 
     StixDB chunks, embeds, and stores the content in the graph.
-    A collection is created automatically if it does not exist yet.
+    The collection must already exist — create one with [cyan]stixdb collections create NAME[/cyan].
 
     Requires a running server — [cyan]stixdb serve[/cyan] or [cyan]stixdb daemon start[/cyan].
 
     Examples:
-      stixdb ingest notes.md
+      stixdb collections create knowledge
+      stixdb ingest notes.md -c knowledge
       stixdb ingest ./docs/ --collection knowledge --tags work,q1
       stixdb ingest report.pdf -c research --chunk-size 800
     """
@@ -473,6 +494,28 @@ def cmd_ingest(
         chunk_overlap = chunk_overlap or 200
 
     abs_path = path.resolve()
+
+    # Check the collection exists before uploading.
+    # Sending an upload to an unknown collection triggers server-side
+    # collection initialisation mid-request, which can reset the TCP
+    # connection on Windows (WinError 10054).  A pre-flight check is the
+    # simplest safeguard.
+    import httpx as _httpx
+    _headers = {"X-API-Key": api_key} if api_key else {}
+    try:
+        _r = _httpx.get(f"{base}/health", headers=_headers, timeout=10)
+        _known = _r.json().get("collections", []) if _r.status_code == 200 else []
+    except Exception:
+        _known = []  # server unreachable — let the upload attempt surface the error
+
+    if _known and coll not in _known:
+        console.print(
+            f"[red]✗[/red] Collection [bold]{coll}[/bold] does not exist.\n"
+            f"  Create it first:  [cyan]stixdb collections create {coll}[/cyan]\n"
+            f"  Existing collections: {', '.join(_known) or '(none)'}" 
+        )
+        raise typer.Exit(1)
+
     if abs_path.is_dir():
         _ingest_folder(base, coll, abs_path, tag_list, chunk_size, chunk_overlap, recursive, api_key)
     else:
@@ -492,28 +535,50 @@ def _ingest_file(
     url = f"{base}/collections/{collection}/upload"
     headers = {"X-API-Key": api_key} if api_key else {}
 
+    import time as _time
+    MAX_RETRIES = 3
+    RETRY_DELAY = 2.0  # seconds — wait for server to finish collection init
+
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as prog:
         prog.add_task(f"Uploading [bold]{filepath.name}[/bold]…")
-        try:
-            with open(filepath, "rb") as fh:
-                r = httpx.post(
-                    url,
-                    files={"file": (filepath.name, fh, "application/octet-stream")},
-                    data={
-                        "tags": ",".join(tags),
-                        "chunk_size": str(chunk_size),
-                        "chunk_overlap": str(chunk_overlap),
-                    },
-                    headers=headers,
-                    timeout=300,
+        r = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                with open(filepath, "rb") as fh:
+                    r = httpx.post(
+                        url,
+                        files={"file": (filepath.name, fh, "application/octet-stream")},
+                        data={
+                            "tags": ",".join(tags),
+                            "chunk_size": str(chunk_size),
+                            "chunk_overlap": str(chunk_overlap),
+                        },
+                        headers=headers,
+                        timeout=300,
+                    )
+                r.raise_for_status()
+                break  # success
+            except httpx.ConnectError:
+                console.print("[red]✗[/red] Cannot reach server.  Run [cyan]stixdb serve[/cyan] or [cyan]stixdb daemon start[/cyan].")
+                raise typer.Exit(1)
+            except httpx.ReadError:
+                # The server reset the connection — this commonly happens on Windows
+                # (WinError 10054) when a new collection is initialised for the first
+                # time and the startup takes longer than the client expects.  Retry.
+                if attempt < MAX_RETRIES:
+                    _time.sleep(RETRY_DELAY)
+                    continue
+                console.print(
+                    f"[red]✗[/red] Server closed the connection after {MAX_RETRIES} attempts.\n"
+                    "  The daemon may still be initialising — wait a few seconds and retry."
                 )
-            r.raise_for_status()
-        except httpx.ConnectError:
-            console.print("[red]✗[/red] Cannot reach server.  Run [cyan]stixdb serve[/cyan] or [cyan]stixdb daemon start[/cyan].")
-            raise typer.Exit(1)
-        except httpx.HTTPStatusError as exc:
-            console.print(f"[red]HTTP {exc.response.status_code}:[/red] {exc.response.text}")
-            raise typer.Exit(1)
+                raise typer.Exit(1)
+            except httpx.HTTPStatusError as exc:
+                console.print(f"[red]HTTP {exc.response.status_code}:[/red] {exc.response.text}")
+                raise typer.Exit(1)
+
+    if r is None:
+        raise typer.Exit(1)
 
     d = r.json()
     console.print(
@@ -639,6 +704,8 @@ def _ingest_folder(
         ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini", ".xml",
         ".csv", ".tsv", ".html", ".htm", ".css", ".scss", ".sass",
         ".pdf",
+        # Images — described by VLM if configured, skipped otherwise
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
     }
 
     # ── 1. Walk directory (respecting .gitignore) ────────────────────────────
@@ -1006,28 +1073,24 @@ def cmd_ask(
     port: int = typer.Option(0, help="Server port."),
     top_k: int = typer.Option(15, "--top-k", "-k", help="Context nodes to retrieve."),
     depth: int = typer.Option(2, help="Graph traversal depth."),
-    thinking: int = typer.Option(1, "--thinking", "-t", help="Thinking steps (>1 enables multi-hop reasoning)."),
-    hops: int = typer.Option(4, "--hops", help="Max retrieval hops per thinking step."),
+    hops: int = typer.Option(8, "--hops", help="Max retrieval iterations before forcing an answer."),
     max_tokens: Optional[int] = typer.Option(None, "--max-tokens", "-m", help="Max tokens for the LLM response. Overrides server default."),
-    stream: bool = typer.Option(False, "--stream", "-s", help="Stream answer tokens progressively as they are generated."),
+    stream: bool = typer.Option(False, "--stream", "-s", help="Stream reasoning steps and answer progressively."),
     json_output: bool = typer.Option(False, "--json", help="Output raw JSON."),
 ):
     """
     [bold]Ask the AI reasoning agent[/bold] a question.
 
-    Retrieves relevant context from the memory graph and synthesises a
-    grounded, cited answer using the configured LLM.
+    The agent autonomously decides how many retrieval hops to perform — it
+    keeps searching until it is confident in the answer.  Use [cyan]--hops[/cyan]
+    to set a safety cap (default 8).
 
-    [bold cyan]Streaming Mode:[/bold cyan]
-    Use [cyan]--stream[/cyan] to print answer tokens as they arrive, Perplexity-style.
-
-    [bold cyan]Thinking Mode:[/bold cyan]
-    Use [cyan]--thinking 2[/cyan] or higher to enable autonomous multi-hop reasoning.
+    Use [cyan]--stream[/cyan] to watch the agent reason in real time.
 
     Examples:
       stixdb ask "What payment processor do we use?"
       stixdb ask "Explain the auth flow" --stream
-      stixdb ask "Summarise our security posture" -c infra --thinking 3
+      stixdb ask "Summarise our security posture" -c infra
       stixdb ask "Who owns the auth service?" --json
     """
     from rich.live import Live
@@ -1041,8 +1104,7 @@ def cmd_ask(
         "top_k": top_k,
         "depth": depth,
         "threshold": 0.2,
-        "thinking_steps": thinking,
-        "hops_per_step": hops,
+        "max_hops": hops,
     }
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
@@ -1056,30 +1118,21 @@ def cmd_ask(
     ))
 
     if stream:
-        buffer = ""
-        first_token = True
-        with Live(
-            Text("Retrieving context…", style="dim"),
-            refresh_per_second=15,
-            console=console,
-            vertical_overflow="visible",
-        ) as live:
-            for chunk in http_stream_post(f"{base}/collections/{coll}/ask/stream", payload, api_key):
-                if chunk.get("type") != "answer":
-                    continue
-                token = chunk.get("content", "")
-                if not token:
-                    continue
-                if first_token:
-                    first_token = False
-                buffer += token
-                live.update(Markdown(buffer))
-
-        # Re-render final answer inside a panel once streaming is complete
+        # Always use the agent loop: show each reasoning hop, then the final answer.
         console.print()
-        if buffer:
+        answer_text = ""
+        for chunk in http_stream_post(f"{base}/collections/{coll}/ask/stream", payload, api_key):
+            ctype = chunk.get("type")
+            if ctype == "thinking":
+                thought = chunk.get("content", "").strip()
+                if thought:
+                    console.print(f"  [dim italic]↳ {escape(thought)}[/dim italic]")
+            elif ctype == "answer":
+                answer_text += chunk.get("content", "")
+        console.print()
+        if answer_text:
             console.print(Panel(
-                Markdown(buffer),
+                Markdown(answer_text),
                 title="[bold green]Answer[/bold green]",
                 border_style="green",
                 padding=(1, 2),
@@ -1088,7 +1141,7 @@ def cmd_ask(
         return
 
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as prog:
-        prog.add_task("Thinking…" if thinking > 1 else "Synthesising…")
+        prog.add_task("Thinking…")
         data = http_post(f"{base}/collections/{coll}/ask", payload, api_key)
 
     if json_output:
